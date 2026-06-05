@@ -680,6 +680,7 @@ def main():
     print("Group-wise RTN PTQ  |  clip-range =", args.clip_range,
           "| bits =", args.bits, "| group =", args.group_size)
     print("Model:", args.model_path, "| device:", args.device)
+    print("Skip lm_head quantization:" , args.skip_lmhead)
     print("=" * 78)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
