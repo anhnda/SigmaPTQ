@@ -142,44 +142,43 @@ class WeightMSE(ClipRange):
 
 
 # ==========================================================================
-# Tier 2 : linear-response   M = G = XX^T/N    (GRAM backend)
-#   e^T G e = sum_j (E G)_{rj} E_{rj}  =  (E @ G * E).sum(dim=1)
+# Tier 2 : linear-response   M = G = XX^T/N    (X backend, like SigmaAware)
+#   e^T G e = (1/N) ||e^T X||^2 = (1/N) sum_t (e_r . x_t)^2
 # ==========================================================================
 class LinearResponse(ClipRange):
     name = "linear_response"
-    uses_gram = True
+    uses_gram = False
 
     def prepare(self, W, *, G=None, X=None, pre_act_fn=None):
-        assert G is not None, "LinearResponse needs precomputed Gram G"
+        assert X is not None, "LinearResponse needs stored X"
         self.W = W
-        self.G = G
+        self.X = X                           # (d_in, n_tok)
+        self.ntok = X.shape[1]
 
     def score(self, E):
-        return (E @ self.G * E).sum(dim=1)
-
+        U = E @ self.X                       # (d_out, n_tok) ; u_{r,t}=e_r.x_t
+        return U.pow(2).sum(dim=1) / self.ntok
 
 # ==========================================================================
 # Tier 3 : mixed  M = (1-lam) I + lam M_inner
-#   inner="linear" : GRAM backend (G = XX^T/N)
+#   inner="linear" : X backend, M_inner = XX^T/N
 #   inner="sigma"  : X backend, single shared mean-slope weighting
 # ==========================================================================
 class Mixed(ClipRange):
     name = "mixed"
+    uses_gram = False
 
     def __init__(self, lam=0.5, inner="linear", n_grid=20, grid_min=0.5, grid_max=1.0):
         super().__init__(n_grid, grid_min, grid_max)
         self.lam = float(lam)
         self.inner = inner
 
-    @property
-    def uses_gram(self):
-        return self.inner == "linear"
-
     def prepare(self, W, *, G=None, X=None, pre_act_fn=None):
         self.W = W
         if self.inner == "linear":
-            assert G is not None, "Mixed(linear) needs precomputed Gram G"
-            self.G = G
+            assert X is not None, "Mixed(linear) needs stored X"
+            self.X = X                       # (d_in, n_tok)
+            self.ntok = X.shape[1]
         else:  # sigma inner: shared mean-slope weighting on stored X
             assert X is not None and pre_act_fn is not None, \
                 "Mixed(sigma) needs stored X and pre_act_fn"
@@ -192,12 +191,12 @@ class Mixed(ClipRange):
     def score(self, E):
         weight_term = E.pow(2).sum(dim=1)
         if self.inner == "linear":
-            inner_term = (E @ self.G * E).sum(dim=1)
+            U = E @ self.X
+            inner_term = U.pow(2).sum(dim=1) / self.ntok
         else:
             EX = E @ self.XS
             inner_term = EX.pow(2).sum(dim=1) / self.ntok
         return (1.0 - self.lam) * weight_term + self.lam * inner_term
-
 
 # ==========================================================================
 # Paper method : sigma-aware   M_sigma = (1/N) X S^2 X^T   (X backend, per-row)

@@ -357,6 +357,26 @@ class XStoreHooks:
         self.hooks = []
 
 
+def _build_cr_for_layer(name, args):
+    """Construct the clip-range object for a layer needing stored X."""
+    if args.clip_range == "sigma_aware":
+        pre_act_fn = make_pre_act_fn(layer_activation(name))
+        cr = build_clip_range("sigma_aware", lam=args.lam, n_grid=args.n_grid)
+        return cr, dict(pre_act_fn=pre_act_fn)
+    if args.clip_range == "linear_response":
+        cr = build_clip_range("linear_response", n_grid=args.n_grid)
+        return cr, dict()
+    if args.clip_range == "mixed":
+        if args.inner == "sigma":
+            pre_act_fn = make_pre_act_fn(layer_activation(name))
+            cr = build_clip_range("mixed", lam=args.lam, inner="sigma",
+                                  n_grid=args.n_grid)
+            return cr, dict(pre_act_fn=pre_act_fn)
+        cr = build_clip_range("mixed", lam=args.lam, inner="linear",
+                              n_grid=args.n_grid)
+        return cr, dict()
+    raise ValueError(f"{args.clip_range} should not use the stored-X backend")
+
 @torch.no_grad()
 def quantize_sigma_backend(model, tokenizer, calib_texts, linear_layers,
                            target_names, args):
@@ -424,6 +444,67 @@ def quantize_sigma_backend(model, tokenizer, calib_texts, linear_layers,
     return stats
 
 
+@torch.no_grad()
+def quantize_xstore_backend(model, tokenizer, calib_texts, linear_layers,
+                            target_names, args):
+    """Stored-X with layer batching for linear_response / mixed / sigma_aware."""
+    device = args.device
+    quant_fn = make_quant_fn(args.bits, args.group_size)
+    bs = args.layer_batch_size
+    groups = [linear_layers[i:i + bs] for i in range(0, len(linear_layers), bs)]
+
+    stats = []
+    bar = tqdm(total=len(linear_layers), desc="Quantizing layers", unit="layer")
+    for gi, group in enumerate(groups):
+        batch_targets = {name for name, _ in group if name in target_names}
+        store = {}
+        if batch_targets:
+            hooks = XStoreHooks(store, args.max_tokens_per_sample)
+            hooks.register(model, batch_targets)
+            run_forward(model, tokenizer, calib_texts, args.n_calib, device,
+                        desc=f"X batch {gi+1}/{len(groups)}")
+            hooks.remove()
+
+        for name, module in group:
+            W = module.weight.data
+            orig_dtype = W.dtype
+            Wf = W.float()
+
+            X = None
+            if name in store and store[name]:
+                Xt = torch.cat(store[name], dim=0)            # (n_tok, d_in)
+                if Xt.shape[0] > args.max_tok_total:
+                    idx = torch.randperm(Xt.shape[0])[:args.max_tok_total]
+                    Xt = Xt[idx]
+                X = Xt.t().contiguous().to(device)            # (d_in, n_tok)
+
+            if X is None:
+                cr = build_clip_range("weight_mse", n_grid=args.n_grid)
+                cr.prepare(Wf)
+            else:
+                cr, extra = _build_cr_for_layer(name, args)
+                cr.prepare(Wf, X=X, **extra)
+
+            clip = cr.select_clip(Wf, quant_fn)
+            module.weight.data = quant_fn(Wf, clip).to(orig_dtype)
+
+            frac = (clip.squeeze(1) /
+                    Wf.abs().amax(dim=1).clamp(min=1e-8)).mean().item()
+            stats.append(frac)
+            bar.update(1)
+            bar.set_postfix_str(f"{name.split('.')[-1]} cf={frac:.3f}")
+
+            if name in store:
+                del store[name]
+            del X
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        store.clear()
+        gc.collect()
+
+    bar.close()
+    return stats
 # ==========================================================================
 # Driver: route to the correct backend.
 # ==========================================================================
@@ -437,30 +518,41 @@ def quantize_model(model, tokenizer, calib_texts, args):
     print(f"\nFound {len(linear_layers)} Linear layers. "
           f"Clip-range: {args.clip_range}")
 
-    if args.clip_range == "sigma_aware" or \
-       (args.clip_range == "mixed" and args.inner == "sigma"):
-        # X backend (per-row slopes). mixed+sigma also needs stored X, but its
-        # shared-mean-slope metric is built inside Mixed.prepare; route it here
-        # too so it gets layer-batched X. We reuse the sigma backend's collector
-        # but build the right clip-range object.
-        if args.clip_range == "sigma_aware":
-            print("Backend: stored-X, layer-batched (sigma-aware, per-row slopes).")
-            stats = quantize_sigma_backend(model, tokenizer, calib_texts,
-                                           linear_layers, target_names, args)
-        else:
-            print("Backend: stored-X, layer-batched (mixed/sigma inner).")
-            stats = quantize_mixed_sigma_backend(model, tokenizer, calib_texts,
-                                                 linear_layers, target_names, args)
+    if args.clip_range == "weight_mse":
+        print("Backend: weight-only (no activations).")
+        stats = quantize_weight_mse_backend(model, linear_layers,
+                                            target_names, args)
     else:
-        print("Backend: Gram accumulation (token-count-independent).")
-        stats = quantize_gram_backend(model, tokenizer, calib_texts,
-                                      linear_layers, target_names, args)
+        print("Backend: stored-X, layer-batched.")
+        stats = quantize_xstore_backend(model, tokenizer, calib_texts,
+                                        linear_layers, target_names, args)
 
     if stats:
         print(f"\nClip selection done. Mean clip fraction across layers: "
               f"{np.mean(stats):.3f}")
 
 
+@torch.no_grad()
+def quantize_weight_mse_backend(model, linear_layers, target_names, args):
+    """weight_mse needs no activations: quantize directly."""
+    quant_fn = make_quant_fn(args.bits, args.group_size)
+    stats = []
+    bar = tqdm(total=len(linear_layers), desc="Quantizing layers", unit="layer")
+    for name, module in linear_layers:
+        W = module.weight.data
+        orig_dtype = W.dtype
+        Wf = W.float()
+        cr = build_clip_range("weight_mse", n_grid=args.n_grid)
+        cr.prepare(Wf)
+        clip = cr.select_clip(Wf, quant_fn)
+        module.weight.data = quant_fn(Wf, clip).to(orig_dtype)
+        frac = (clip.squeeze(1) /
+                Wf.abs().amax(dim=1).clamp(min=1e-8)).mean().item()
+        stats.append(frac)
+        bar.update(1)
+        bar.set_postfix_str(f"{name.split('.')[-1]} cf={frac:.3f}")
+    bar.close()
+    return stats
 @torch.no_grad()
 def quantize_mixed_sigma_backend(model, tokenizer, calib_texts, linear_layers,
                                  target_names, args):
