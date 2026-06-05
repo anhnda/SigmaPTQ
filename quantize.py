@@ -126,80 +126,16 @@ def make_pre_act_fn(act: str = "silu"):
 
 
 # ==========================================================================
-# Activation collection
-# ==========================================================================
-class ActCollector:
-    def __init__(self, model, max_tokens_per_sample=512, device="cuda"):
-        self.model = model
-        self.acts = {}          # name -> list of (n_tok_sub, d_in) cpu float
-        self.hooks = []
-        self.max_tokens = max_tokens_per_sample
-        self.device = device
-
-    def _hook(self, name):
-        def hook(_m, inp, _o):
-            x = inp[0] if isinstance(inp, tuple) else inp
-            if x.dim() == 3 and x.shape[1] > self.max_tokens:
-                idx = torch.randperm(x.shape[1], device=x.device)[:self.max_tokens]
-                idx = idx.sort()[0]
-                x = x[:, idx, :]
-            self.acts.setdefault(name, []).append(
-                x.detach().reshape(-1, x.shape[-1]).cpu().float()
-            )
-        return hook
-
-    def collect(self, tokenizer, texts, n_samples, target_names):
-        for name, module in self.model.named_modules():
-            if name in target_names:
-                self.hooks.append(module.register_forward_hook(self._hook(name)))
-
-        with torch.no_grad():
-            for i, text in enumerate(texts[:n_samples]):
-                try:
-                    enc = tokenizer(text, return_tensors="pt",
-                                    truncation=True, max_length=512)
-                    enc = {k: v.to(self.device) for k, v in enc.items()}
-                    _ = self.model(**enc, use_cache=False)
-                    if (i + 1) % 16 == 0 and torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                except Exception as e:
-                    if i == 0:
-                        print(f"  forward error: {str(e)[:120]}")
-                    continue
-
-        for h in self.hooks:
-            h.remove()
-        self.hooks = []
-
-    def get(self, name, device, max_tok=4096):
-        """Return X of shape (d_in, n_tok) on `device`, subsampled to max_tok."""
-        if name not in self.acts or not self.acts[name]:
-            return None
-        Xt = torch.cat(self.acts[name], dim=0)        # (n_tok, d_in)
-        if Xt.shape[0] > max_tok:
-            idx = torch.randperm(Xt.shape[0])[:max_tok]
-            Xt = Xt[idx]
-        return Xt.t().contiguous().to(device)         # (d_in, n_tok)
-
-    def clear(self):
-        self.acts = {}
-        gc.collect()
-
-
-# ==========================================================================
-# Layer-name -> activation nonlinearity mapping.
-# For Llama/Mistral SwiGLU: gate_proj & up_proj feed SiLU. Others -> identity.
+# Layer metadata helpers
 # ==========================================================================
 def layer_activation(name: str) -> str:
+    """Nonlinearity that follows this layer (for sigma slopes)."""
     n = name.lower()
     if "gate_proj" in n or "up_proj" in n:
         return "silu"
     return "identity"
 
 
-# ==========================================================================
-# Calibration loader (lightweight WikiText-2; reuse paper's utils if present)
-# ==========================================================================
 def load_calib(tokenizer, dataset, n_samples, seqlen, seed, cache_dir):
     try:
         from calibration_utils import (get_c4_calibration_data,
@@ -219,76 +155,343 @@ def load_calib(tokenizer, dataset, n_samples, seqlen, seed, cache_dir):
     return texts[:n_samples]
 
 
+def run_forward(model, tokenizer, texts, n_samples, device):
+    """One pass of calibration data through the model (hooks fire)."""
+    with torch.no_grad():
+        for i, text in enumerate(texts[:n_samples]):
+            try:
+                enc = tokenizer(text, return_tensors="pt",
+                                truncation=True, max_length=512)
+                enc = {k: v.to(device) for k, v in enc.items()}
+                _ = model(**enc, use_cache=False)
+                if (i + 1) % 16 == 0 and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception as e:
+                if i == 0:
+                    print(f"  forward error: {str(e)[:120]}")
+                continue
+
+
 # ==========================================================================
-# Main quantization driver
+# BACKEND A : Gram accumulation (Tier 1/2/3).
+#   One forward pass. Hooks accumulate G = XX^T/N per layer incrementally;
+#   activations are never stored. Token-count-independent (d_in^2 per layer).
+#   If --gram-layer-batch > 0, layers are processed in groups to cap the
+#   number of live Gram matrices (trades passes for RAM).
+# ==========================================================================
+class GramHooks:
+    """Registers hooks that fold each layer's activations into a GramAccumulator."""
+
+    def __init__(self, accums, max_tokens, gram_device):
+        # accums: dict name -> GramAccumulator
+        self.accums = accums
+        self.max_tokens = max_tokens
+        self.gram_device = gram_device
+        self.hooks = []
+
+    def _hook(self, name):
+        acc = self.accums[name]
+
+        def hook(_m, inp, _o):
+            x = inp[0] if isinstance(inp, tuple) else inp
+            if x.dim() == 3 and x.shape[1] > self.max_tokens:
+                idx = torch.randperm(x.shape[1], device=x.device)[:self.max_tokens]
+                idx = idx.sort()[0]
+                x = x[:, idx, :]
+            Xc = x.detach().reshape(-1, x.shape[-1]).t().contiguous()  # (d_in, n)
+            acc.update(Xc)        # accumulator handles device/dtype move
+        return hook
+
+    def register(self, model, names):
+        for name, module in model.named_modules():
+            if name in names:
+                self.hooks.append(module.register_forward_hook(self._hook(name)))
+
+    def remove(self):
+        for h in self.hooks:
+            h.remove()
+        self.hooks = []
+
+
+@torch.no_grad()
+def quantize_gram_backend(model, tokenizer, calib_texts, linear_layers,
+                          target_names, args):
+    """Tier 1/2/3 path: accumulate Gram, then per-layer clip search + RTN."""
+    from base_cr import GramAccumulator
+    device = args.device
+    quant_fn = make_quant_fn(args.bits, args.group_size)
+    needs_acts = args.clip_range in ("linear_response", "mixed")  # weight_mse: none
+    # Gram matrices live on CPU by default to save VRAM; scoring moves the one
+    # active layer's Gram to GPU.
+    gram_device = "cpu" if args.gram_on_cpu else device
+
+    # Determine which layers are processed together. If gram_layer_batch<=0,
+    # all layers' Grams are accumulated in a single pass (max RAM, 1 pass).
+    if not needs_acts:
+        groups = [linear_layers]  # weight_mse: no activations, single trivial group
+    elif args.gram_layer_batch and args.gram_layer_batch > 0:
+        groups = [linear_layers[i:i + args.gram_layer_batch]
+                  for i in range(0, len(linear_layers), args.gram_layer_batch)]
+    else:
+        groups = [linear_layers]
+
+    stats = []
+    quantized = 0
+    for gi, group in enumerate(groups):
+        # Build accumulators only for layers in this group that need acts and
+        # actually collect activations (skip lm_head etc.).
+        accums = {}
+        if needs_acts:
+            for name, module in group:
+                if name in target_names:
+                    d_in = module.weight.shape[1]
+                    accums[name] = GramAccumulator(d_in, gram_device, torch.float32)
+            if accums:
+                hooks = GramHooks(accums, args.max_tokens_per_sample, gram_device)
+                hooks.register(model, set(accums.keys()))
+                if len(groups) > 1:
+                    print(f"  [Gram pass {gi+1}/{len(groups)}] "
+                          f"accumulating {len(accums)} layers...")
+                else:
+                    print(f"  [Gram pass] accumulating {len(accums)} layers "
+                          "in a single pass...")
+                run_forward(model, tokenizer, calib_texts, args.n_calib, device)
+                hooks.remove()
+
+        # Quantize every layer in this group.
+        for name, module in group:
+            W = module.weight.data
+            orig_dtype = W.dtype
+            Wf = W.float()
+
+            G = None
+            if needs_acts and name in accums:
+                G = accums[name].finalize().to(device)
+
+            if needs_acts and G is None:
+                # layer had no activations (e.g. lm_head) -> weight_mse fallback
+                cr = build_clip_range("weight_mse", n_grid=args.n_grid)
+                cr.prepare(Wf)
+            else:
+                cr = build_clip_range(args.clip_range, lam=args.lam,
+                                      inner=args.inner, n_grid=args.n_grid)
+                cr.prepare(Wf, G=G)
+
+            clip = cr.select_clip(Wf, quant_fn)
+            module.weight.data = quant_fn(Wf, clip).to(orig_dtype)
+
+            frac = (clip.squeeze(1) /
+                    Wf.abs().amax(dim=1).clamp(min=1e-8)).mean().item()
+            stats.append(frac)
+            quantized += 1
+            if quantized <= 3 or quantized % 25 == 0:
+                print(f"    [{quantized}/{len(linear_layers)}] {name}: "
+                      f"mean clip frac={frac:.3f}")
+
+            del G
+            if name in accums:
+                del accums[name]
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        accums.clear()
+        gc.collect()
+
+    return stats
+
+
+# ==========================================================================
+# BACKEND B : stored-X, layer-batched (sigma-aware).
+#   Per-row slopes prevent a single shared Gram, so activations are stored.
+#   Layers are processed in batches: collect X for the batch in one pass,
+#   quantize, free, repeat. RAM is bounded by batch_size * per-layer-X.
+# ==========================================================================
+class XStoreHooks:
+    def __init__(self, store, max_tokens):
+        self.store = store        # name -> list of (n, d_in) cpu float
+        self.max_tokens = max_tokens
+        self.hooks = []
+
+    def _hook(self, name):
+        def hook(_m, inp, _o):
+            x = inp[0] if isinstance(inp, tuple) else inp
+            if x.dim() == 3 and x.shape[1] > self.max_tokens:
+                idx = torch.randperm(x.shape[1], device=x.device)[:self.max_tokens]
+                idx = idx.sort()[0]
+                x = x[:, idx, :]
+            self.store.setdefault(name, []).append(
+                x.detach().reshape(-1, x.shape[-1]).cpu().float())
+        return hook
+
+    def register(self, model, names):
+        for name, module in model.named_modules():
+            if name in names:
+                self.hooks.append(module.register_forward_hook(self._hook(name)))
+
+    def remove(self):
+        for h in self.hooks:
+            h.remove()
+        self.hooks = []
+
+
+@torch.no_grad()
+def quantize_sigma_backend(model, tokenizer, calib_texts, linear_layers,
+                           target_names, args):
+    """Sigma-aware path: stored-X with layer batching."""
+    device = args.device
+    quant_fn = make_quant_fn(args.bits, args.group_size)
+    bs = args.layer_batch_size
+    groups = [linear_layers[i:i + bs] for i in range(0, len(linear_layers), bs)]
+
+    stats = []
+    quantized = 0
+    for gi, group in enumerate(groups):
+        batch_targets = {name for name, _ in group if name in target_names}
+        store = {}
+        if batch_targets:
+            hooks = XStoreHooks(store, args.max_tokens_per_sample)
+            hooks.register(model, batch_targets)
+            print(f"  [sigma batch {gi+1}/{len(groups)}] "
+                  f"collecting X for {len(batch_targets)} layers...")
+            run_forward(model, tokenizer, calib_texts, args.n_calib, device)
+            hooks.remove()
+
+        for name, module in group:
+            W = module.weight.data
+            orig_dtype = W.dtype
+            Wf = W.float()
+
+            X = None
+            if name in store and store[name]:
+                Xt = torch.cat(store[name], dim=0)            # (n_tok, d_in)
+                if Xt.shape[0] > args.max_tok_total:
+                    idx = torch.randperm(Xt.shape[0])[:args.max_tok_total]
+                    Xt = Xt[idx]
+                X = Xt.t().contiguous().to(device)            # (d_in, n_tok)
+
+            if X is None:
+                cr = build_clip_range("weight_mse", n_grid=args.n_grid)
+                cr.prepare(Wf)
+            else:
+                pre_act_fn = make_pre_act_fn(layer_activation(name))
+                cr = build_clip_range("sigma_aware", lam=args.lam,
+                                      n_grid=args.n_grid)
+                cr.prepare(Wf, X=X, pre_act_fn=pre_act_fn)
+
+            clip = cr.select_clip(Wf, quant_fn)
+            module.weight.data = quant_fn(Wf, clip).to(orig_dtype)
+
+            frac = (clip.squeeze(1) /
+                    Wf.abs().amax(dim=1).clamp(min=1e-8)).mean().item()
+            stats.append(frac)
+            quantized += 1
+            if quantized <= 3 or quantized % 25 == 0:
+                print(f"    [{quantized}/{len(linear_layers)}] {name}: "
+                      f"mean clip frac={frac:.3f}")
+
+            if name in store:
+                del store[name]
+            del X
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        store.clear()
+        gc.collect()
+
+    return stats
+
+
+# ==========================================================================
+# Driver: route to the correct backend.
 # ==========================================================================
 @torch.no_grad()
 def quantize_model(model, tokenizer, calib_texts, args):
-    device = args.device
-    quant_fn = make_quant_fn(args.bits, args.group_size)
-
     linear_layers = [(name, m) for name, m in model.named_modules()
                      if isinstance(m, nn.Linear)]
-    # Skip lm_head by default for activation collection unless requested;
-    # it is still quantized with weight_mse (no activations needed) if absent.
     target_names = {name for name, _ in linear_layers
                     if "lm_head" not in name.lower()}
 
     print(f"\nFound {len(linear_layers)} Linear layers. "
-          f"Clip-range method: {args.clip_range}")
+          f"Clip-range: {args.clip_range}")
 
-    needs_acts = args.clip_range in ("linear_response", "mixed", "sigma_aware")
-
-    collector = ActCollector(model, args.max_tokens_per_sample, device)
-    if needs_acts:
-        print("Collecting calibration activations (single hook pass)...")
-        collector.collect(tokenizer, calib_texts, args.n_calib, target_names)
-
-    stats = []
-    for idx, (name, module) in enumerate(linear_layers):
-        W = module.weight.data
-        orig_dtype = W.dtype
-        Wf = W.float()
-
-        # Pick the clip-range method. lm_head / layers w/o activations fall
-        # back to weight_mse so the pipeline never stalls.
-        X = collector.get(name, device) if needs_acts else None
-        if needs_acts and X is None:
-            cr = build_clip_range("weight_mse", n_grid=args.n_grid)
-            cr.prepare(None, Wf)
+    if args.clip_range == "sigma_aware" or \
+       (args.clip_range == "mixed" and args.inner == "sigma"):
+        # X backend (per-row slopes). mixed+sigma also needs stored X, but its
+        # shared-mean-slope metric is built inside Mixed.prepare; route it here
+        # too so it gets layer-batched X. We reuse the sigma backend's collector
+        # but build the right clip-range object.
+        if args.clip_range == "sigma_aware":
+            print("Backend: stored-X, layer-batched (sigma-aware, per-row slopes).")
+            stats = quantize_sigma_backend(model, tokenizer, calib_texts,
+                                           linear_layers, target_names, args)
         else:
-            inner = args.inner
-            pre_act_fn = None
-            if args.clip_range == "sigma_aware":
-                pre_act_fn = make_pre_act_fn(layer_activation(name))
-            elif args.clip_range == "mixed" and inner == "sigma":
-                pre_act_fn = make_pre_act_fn(layer_activation(name))
-            cr = build_clip_range(args.clip_range, lam=args.lam, inner=inner,
-                                  n_grid=args.n_grid)
-            cr.prepare(X.to(torch.float32) if X is not None else None, Wf,
-                       pre_act_fn=pre_act_fn)
+            print("Backend: stored-X, layer-batched (mixed/sigma inner).")
+            stats = quantize_mixed_sigma_backend(model, tokenizer, calib_texts,
+                                                 linear_layers, target_names, args)
+    else:
+        print("Backend: Gram accumulation (token-count-independent).")
+        stats = quantize_gram_backend(model, tokenizer, calib_texts,
+                                      linear_layers, target_names, args)
 
-        clip = cr.select_clip(Wf, quant_fn)           # (d_out, 1)
-        Wq = quant_fn(Wf, clip).to(orig_dtype)
-        module.weight.data = Wq
-
-        mean_frac = (clip.squeeze(1) /
-                     Wf.abs().amax(dim=1).clamp(min=1e-8)).mean().item()
-        stats.append(mean_frac)
-
-        if idx < 3 or (idx + 1) % 25 == 0:
-            print(f"  [{idx+1}/{len(linear_layers)}] {name}: "
-                  f"mean clip frac={mean_frac:.3f}")
-
-        del X
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    collector.clear()
     if stats:
         print(f"\nClip selection done. Mean clip fraction across layers: "
               f"{np.mean(stats):.3f}")
 
+
+@torch.no_grad()
+def quantize_mixed_sigma_backend(model, tokenizer, calib_texts, linear_layers,
+                                 target_names, args):
+    """mixed + inner=sigma: stored-X batched, shared mean-slope metric."""
+    device = args.device
+    quant_fn = make_quant_fn(args.bits, args.group_size)
+    bs = args.layer_batch_size
+    groups = [linear_layers[i:i + bs] for i in range(0, len(linear_layers), bs)]
+    stats = []
+    quantized = 0
+    for gi, group in enumerate(groups):
+        batch_targets = {name for name, _ in group if name in target_names}
+        store = {}
+        if batch_targets:
+            hooks = XStoreHooks(store, args.max_tokens_per_sample)
+            hooks.register(model, batch_targets)
+            print(f"  [mixed-sigma batch {gi+1}/{len(groups)}] "
+                  f"collecting X for {len(batch_targets)} layers...")
+            run_forward(model, tokenizer, calib_texts, args.n_calib, device)
+            hooks.remove()
+        for name, module in group:
+            W = module.weight.data
+            orig_dtype = W.dtype
+            Wf = W.float()
+            X = None
+            if name in store and store[name]:
+                Xt = torch.cat(store[name], dim=0)
+                if Xt.shape[0] > args.max_tok_total:
+                    idx = torch.randperm(Xt.shape[0])[:args.max_tok_total]
+                    Xt = Xt[idx]
+                X = Xt.t().contiguous().to(device)
+            if X is None:
+                cr = build_clip_range("weight_mse", n_grid=args.n_grid)
+                cr.prepare(Wf)
+            else:
+                pre_act_fn = make_pre_act_fn(layer_activation(name))
+                cr = build_clip_range("mixed", lam=args.lam, inner="sigma",
+                                      n_grid=args.n_grid)
+                cr.prepare(Wf, X=X, pre_act_fn=pre_act_fn)
+            clip = cr.select_clip(Wf, quant_fn)
+            module.weight.data = quant_fn(Wf, clip).to(orig_dtype)
+            frac = (clip.squeeze(1) /
+                    Wf.abs().amax(dim=1).clamp(min=1e-8)).mean().item()
+            stats.append(frac); quantized += 1
+            if quantized <= 3 or quantized % 25 == 0:
+                print(f"    [{quantized}/{len(linear_layers)}] {name}: "
+                      f"mean clip frac={frac:.3f}")
+            if name in store:
+                del store[name]
+            del X
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        store.clear(); gc.collect()
+    return stats
 
 def main():
     p = argparse.ArgumentParser(
@@ -310,8 +513,26 @@ def main():
     p.add_argument("--n-grid", type=int, default=20)
     p.add_argument("--n-calib", type=int, default=128)
     p.add_argument("--seqlen", type=int, default=2048)
-    p.add_argument("--max-tokens-per-sample", type=int, default=512)
-    p.add_argument("--calib-dataset", type=str, default="c4",
+    p.add_argument("--max-tokens-per-sample", type=int, default=512,
+                   help="Tokens kept per sample at the hook (subsample).")
+    # --- memory control ---
+    p.add_argument("--gram-layer-batch", type=int, default=0,
+                   help="Gram backend (Tier1/2/3): layers per accumulation pass. "
+                        "0 = all layers in ONE pass (max RAM ~ sum of d_in^2, "
+                        "but token-count-independent). >0 trades extra passes "
+                        "for lower peak RAM (caps live Gram matrices).")
+    p.add_argument("--gram-on-cpu", action="store_true", default=True,
+                   help="Hold Gram matrices on CPU (default); scoring moves the "
+                        "active layer's Gram to GPU. Saves VRAM.")
+    p.add_argument("--gram-on-gpu", dest="gram_on_cpu", action="store_false",
+                   help="Keep Gram matrices on GPU (faster, more VRAM).")
+    p.add_argument("--layer-batch-size", type=int, default=16,
+                   help="Sigma backend: layers per X-collection batch. "
+                        "Caps CPU RAM at batch_size * per-layer stored X.")
+    p.add_argument("--max-tok-total", type=int, default=4096,
+                   help="Sigma backend: max total tokens kept per layer in X "
+                        "(stored-X memory scales linearly with this).")
+    p.add_argument("--calib-dataset", type=str, default="wikitext2",
                    choices=["c4", "wikitext2"])
     p.add_argument("--cache-dir", type=str, default="./calibration_cache")
     p.add_argument("--seed", type=int, default=42)
