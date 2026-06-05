@@ -311,7 +311,7 @@ def main():
     p.add_argument("--n-calib", type=int, default=128)
     p.add_argument("--seqlen", type=int, default=2048)
     p.add_argument("--max-tokens-per-sample", type=int, default=512)
-    p.add_argument("--calib-dataset", type=str, default="wikitext2",
+    p.add_argument("--calib-dataset", type=str, default="c4",
                    choices=["c4", "wikitext2"])
     p.add_argument("--cache-dir", type=str, default="./calibration_cache")
     p.add_argument("--seed", type=int, default=42)
