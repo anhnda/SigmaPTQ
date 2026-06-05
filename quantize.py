@@ -41,6 +41,24 @@ import torch.nn as nn
 
 from base_cr import build_clip_range
 
+try:
+    from tqdm import tqdm
+except ImportError:  # graceful no-op fallback if tqdm absent
+    class _NoOpBar:
+        def __init__(self, iterable=None):
+            self._it = iterable
+        def __iter__(self):
+            return iter(self._it or [])
+        def update(self, *a, **k):
+            pass
+        def set_postfix_str(self, *a, **k):
+            pass
+        def close(self):
+            pass
+
+    def tqdm(iterable=None, **kw):
+        return _NoOpBar(iterable)
+
 
 # ==========================================================================
 # Group-wise symmetric RTN quantizer
@@ -155,10 +173,12 @@ def load_calib(tokenizer, dataset, n_samples, seqlen, seed, cache_dir):
     return texts[:n_samples]
 
 
-def run_forward(model, tokenizer, texts, n_samples, device):
+def run_forward(model, tokenizer, texts, n_samples, device, desc="calibration"):
     """One pass of calibration data through the model (hooks fire)."""
+    n = min(n_samples, len(texts))
     with torch.no_grad():
-        for i, text in enumerate(texts[:n_samples]):
+        for i, text in enumerate(tqdm(texts[:n_samples], total=n, desc=desc,
+                                      unit="sample", leave=False)):
             try:
                 enc = tokenizer(text, return_tensors="pt",
                                 truncation=True, max_length=512)
@@ -237,6 +257,7 @@ def quantize_gram_backend(model, tokenizer, calib_texts, linear_layers,
 
     stats = []
     quantized = 0
+    bar = tqdm(total=len(linear_layers), desc="Quantizing layers", unit="layer")
     for gi, group in enumerate(groups):
         # Build accumulators only for layers in this group that need acts and
         # actually collect activations (skip lm_head etc.).
@@ -255,7 +276,9 @@ def quantize_gram_backend(model, tokenizer, calib_texts, linear_layers,
                 else:
                     print(f"  [Gram pass] accumulating {len(accums)} layers "
                           "in a single pass...")
-                run_forward(model, tokenizer, calib_texts, args.n_calib, device)
+                run_forward(model, tokenizer, calib_texts, args.n_calib, device,
+                            desc=f"Gram pass {gi+1}/{len(groups)}"
+                            if len(groups) > 1 else "Gram pass")
                 hooks.remove()
 
         # Quantize every layer in this group.
@@ -284,9 +307,8 @@ def quantize_gram_backend(model, tokenizer, calib_texts, linear_layers,
                     Wf.abs().amax(dim=1).clamp(min=1e-8)).mean().item()
             stats.append(frac)
             quantized += 1
-            if quantized <= 3 or quantized % 25 == 0:
-                print(f"    [{quantized}/{len(linear_layers)}] {name}: "
-                      f"mean clip frac={frac:.3f}")
+            bar.update(1)
+            bar.set_postfix_str(f"{name.split('.')[-1]} cf={frac:.3f}")
 
             del G
             if name in accums:
@@ -297,6 +319,7 @@ def quantize_gram_backend(model, tokenizer, calib_texts, linear_layers,
         accums.clear()
         gc.collect()
 
+    bar.close()
     return stats
 
 
@@ -345,15 +368,15 @@ def quantize_sigma_backend(model, tokenizer, calib_texts, linear_layers,
 
     stats = []
     quantized = 0
+    bar = tqdm(total=len(linear_layers), desc="Quantizing layers", unit="layer")
     for gi, group in enumerate(groups):
         batch_targets = {name for name, _ in group if name in target_names}
         store = {}
         if batch_targets:
             hooks = XStoreHooks(store, args.max_tokens_per_sample)
             hooks.register(model, batch_targets)
-            print(f"  [sigma batch {gi+1}/{len(groups)}] "
-                  f"collecting X for {len(batch_targets)} layers...")
-            run_forward(model, tokenizer, calib_texts, args.n_calib, device)
+            run_forward(model, tokenizer, calib_texts, args.n_calib, device,
+                        desc=f"sigma batch {gi+1}/{len(groups)}")
             hooks.remove()
 
         for name, module in group:
@@ -385,9 +408,8 @@ def quantize_sigma_backend(model, tokenizer, calib_texts, linear_layers,
                     Wf.abs().amax(dim=1).clamp(min=1e-8)).mean().item()
             stats.append(frac)
             quantized += 1
-            if quantized <= 3 or quantized % 25 == 0:
-                print(f"    [{quantized}/{len(linear_layers)}] {name}: "
-                      f"mean clip frac={frac:.3f}")
+            bar.update(1)
+            bar.set_postfix_str(f"{name.split('.')[-1]} cf={frac:.3f}")
 
             if name in store:
                 del store[name]
@@ -398,6 +420,7 @@ def quantize_sigma_backend(model, tokenizer, calib_texts, linear_layers,
         store.clear()
         gc.collect()
 
+    bar.close()
     return stats
 
 
@@ -448,15 +471,15 @@ def quantize_mixed_sigma_backend(model, tokenizer, calib_texts, linear_layers,
     groups = [linear_layers[i:i + bs] for i in range(0, len(linear_layers), bs)]
     stats = []
     quantized = 0
+    bar = tqdm(total=len(linear_layers), desc="Quantizing layers", unit="layer")
     for gi, group in enumerate(groups):
         batch_targets = {name for name, _ in group if name in target_names}
         store = {}
         if batch_targets:
             hooks = XStoreHooks(store, args.max_tokens_per_sample)
             hooks.register(model, batch_targets)
-            print(f"  [mixed-sigma batch {gi+1}/{len(groups)}] "
-                  f"collecting X for {len(batch_targets)} layers...")
-            run_forward(model, tokenizer, calib_texts, args.n_calib, device)
+            run_forward(model, tokenizer, calib_texts, args.n_calib, device,
+                        desc=f"mixed-sigma batch {gi+1}/{len(groups)}")
             hooks.remove()
         for name, module in group:
             W = module.weight.data
@@ -482,15 +505,15 @@ def quantize_mixed_sigma_backend(model, tokenizer, calib_texts, linear_layers,
             frac = (clip.squeeze(1) /
                     Wf.abs().amax(dim=1).clamp(min=1e-8)).mean().item()
             stats.append(frac); quantized += 1
-            if quantized <= 3 or quantized % 25 == 0:
-                print(f"    [{quantized}/{len(linear_layers)}] {name}: "
-                      f"mean clip frac={frac:.3f}")
+            bar.update(1)
+            bar.set_postfix_str(f"{name.split('.')[-1]} cf={frac:.3f}")
             if name in store:
                 del store[name]
             del X
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         store.clear(); gc.collect()
+    bar.close()
     return stats
 
 def main():

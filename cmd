@@ -5,17 +5,20 @@ python quantize.py \
   --bits 4 --group-size 128 \
   --output-dir ./quantized_models/rtn_w4_weightmse
 
+
 python quantize.py \
   --model-path /home/DATA/prometheus/anh/.cache/huggingface/hub/models--meta-llama--Meta-Llama-3.1-8B/snapshots/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b \
   --clip-range linear_response \
   --bits 4 --group-size 128 \
   --output-dir ./quantized_models/rtn_w4_linear
 
+
 python quantize.py \
   --model-path /home/DATA/prometheus/anh/.cache/huggingface/hub/models--meta-llama--Meta-Llama-3.1-8B/snapshots/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b \
   --clip-range mixed --inner linear --lam 0.5 \
   --bits 4 --group-size 128 --n-calib 128 \
   --output-dir ./quantized_models/rtn_w4_mixed
+  
 python quantize.py \
   --model-path /home/DATA/prometheus/anh/.cache/huggingface/hub/models--meta-llama--Meta-Llama-3.1-8B/snapshots/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b \
   --clip-range sigma_aware --lam 0.9 \
