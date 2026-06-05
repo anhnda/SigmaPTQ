@@ -466,6 +466,10 @@ def quantize_xstore_backend(model, tokenizer, calib_texts, linear_layers,
             hooks.remove()
 
         for name, module in group:
+            if args.skip_lmhead and "lm_head" in name.lower():
+                bar.update(1)
+                bar.set_postfix_str(f"{name.split('.')[-1]} SKIPPED")
+                continue
             W = module.weight.data
             orig_dtype = W.dtype
             Wf = W.float()
@@ -539,6 +543,10 @@ def quantize_weight_mse_backend(model, linear_layers, target_names, args):
     stats = []
     bar = tqdm(total=len(linear_layers), desc="Quantizing layers", unit="layer")
     for name, module in linear_layers:
+        if args.skip_lmhead and "lm_head" in name.lower():
+            bar.update(1)
+            bar.set_postfix_str(f"{name.split('.')[-1]} SKIPPED")
+            continue
         W = module.weight.data
         orig_dtype = W.dtype
         Wf = W.float()
@@ -650,7 +658,13 @@ def main():
     p.add_argument("--calib-dataset", type=str, default="wikitext2",
                    choices=["c4", "wikitext2"])
     p.add_argument("--cache-dir", type=str, default="./calibration_cache")
+    p.add_argument("--skip-lmhead", dest="skip_lmhead", action="store_true",
+                   default=True, help="Skip quantizing lm_head (leave it in "
+                                      "original precision). Default: True.")
+    p.add_argument("--quant-lmhead", dest="skip_lmhead", action="store_false",
+                   help="Also quantize lm_head.")
     p.add_argument("--seed", type=int, default=42)
+
     args = p.parse_args()
 
     random.seed(args.seed)
