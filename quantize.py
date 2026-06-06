@@ -32,8 +32,7 @@ import torch
 import torch.nn as nn
 
 # Group-wise clip-range classes AND the matching per-group quantizer.
-from base_cr_groupwise import build_clip_range, make_quant_fn
-
+from base_cr import build_clip_range, make_quant_fn
 try:
     from tqdm import tqdm
 except ImportError:  # graceful no-op fallback if tqdm absent
