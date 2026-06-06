@@ -1,157 +1,112 @@
 """
-sensitivity.py
-==============
-Per-token squared sensitivities  s^2_{i,t}  from the local-Jacobian metric
+coupling.py
+===========
+Builds the per-layer score callable, and — crucially — resolves the SwiGLU
+gate/up projections as a COUPLED PAIR so each gets the sibling response it needs.
 
-    M_i = (1/N) X diag(s^2_{i,t}) X^T          (paper Eq. 8)
+Why coupling is required (verified against Llama-3.1, Mistral-v0.3, Qwen2.5):
+    h_t = SiLU(g_t) ⊙ u_t,   g_t = W_g x_t,   u_t = W_u x_t
+    gate metric (Eq.11): s^2_{k,t} = rho_k u_{k,t}^2 SiLU'(g_{k,t})^2  -> needs u
+    up   metric (Eq.13): s^2_{k,t} = rho_k SiLU(g_{k,t})^2            -> needs g
+A per-layer prepare() that sees only its own W and X CANNOT form these. The
+coupler computes g = W_g@X and u = W_u@X once per block and hands the correct
+combination to each layer's sensitivity.
 
-The ONLY thing that varies across M_2, M_sigma, M_gate, M_up is how s^2_{i,t}
-is produced. Each provider returns a tensor whose SHAPE encodes its kind:
+The down projection's column norms rho_k = ||W_d^{(:,k)}||^2 are the optional
+downstream gain (Eq.14); pass use_rho=False to disable (rho_k ≡ 1).
 
-    scalar         : s2 is the python float 1.0          -> linear response M_2
-    per_token      : s2 shape (n_tok,)   row-shared       (rarely used here)
-    per_row_token  : s2 shape (d_out, n_tok) per (row, token)
-
-The generic reducer in metric.py consumes any of these uniformly.
-
-Verified architecture (Llama-3.1, Mistral-v0.3, Qwen2.5, all HF):
-    h_t = SiLU(g_t) ⊙ u_t ,   g_t = W_g x_t ,  u_t = W_u x_t ,  y_t = W_d h_t
-
-Paper sensitivities (Eqs. 11, 13, 14), per intermediate channel k:
-    gate :  s^2_{k,t} = rho_k * u_{k,t}^2 * SiLU'(g_{k,t})^2
-    up   :  s^2_{k,t} = rho_k * SiLU(g_{k,t})^2
-    rho_k = ||W_d^{(:,k)}||^2   (downstream gain; rho_k ≡ 1 disables it)
-
-g_{k,t} and u_{k,t} are the SIBLING projections' linear responses, so the gate
-metric needs W_u@X and the up metric needs W_g@X. Neither layer can compute its
-own metric in isolation; the block-level coupler (see coupling.py) supplies the
-sibling response.
+Metrics offered:
+    weight_mse        M = I                                  (no activations)
+    linear_response   M = XX^T/N         s^2 = 1
+    pointwise         M = XS^2X^T/N       s^2 = sigma'(Wx)^2  (incomplete gate)
+    gate              Eq.11 (+Eq.14)      coupled, needs sibling up
+    up                Eq.13 (+Eq.14)      coupled, needs sibling gate
+    mixed             (1-lam) I + lam * <inner>
 """
 
 from __future__ import annotations
 
 import torch
+from typing import Callable
+
+import metric
+import sensitivity as sens
+
+ScoreFn = Callable[[torch.Tensor], torch.Tensor]
 
 
 # --------------------------------------------------------------------------
-# SiLU and its derivative (Swish, beta = 1):  SiLU(z) = z * sigmoid(z)
-#   SiLU'(z) = sigmoid(z) + z * sigmoid(z) * (1 - sigmoid(z))
+# Generic score builder: given a Sensitivity object (or None for weight_mse),
+# return score(E) -> (d_out, n_groups), with optional identity floor lam.
 # --------------------------------------------------------------------------
-def silu(z: torch.Tensor) -> torch.Tensor:
-    return z * torch.sigmoid(z)
+def build_score_fn(W: torch.Tensor, *, group_size: int,
+                   X: torch.Tensor | None = None,
+                   sensitivity: sens.Sensitivity | None = None,
+                   lam: float = 0.0) -> ScoreFn:
+    """
+    sensitivity is None  -> pure weight_mse (M=I).
+    sensitivity present  -> activation score; if 0<lam<1 mix with identity:
+                            (1-lam)*weight + lam*activation.
+    lam semantics match the old SigmaAware/Mixed: lam=0 => activation only when
+    a sensitivity is given (we treat None separately as weight_mse).
+    """
+    d_out, d_in = W.shape
+    gidx, n_groups, _ = metric.group_index(d_in, group_size, W.device)
 
+    if sensitivity is None:
+        def score_fn(E):
+            return metric.weight_score(E, gidx, n_groups)
+        return score_fn
 
-def silu_prime(z: torch.Tensor) -> torch.Tensor:
-    s = torch.sigmoid(z)
-    return s + z * s * (1.0 - s)
+    assert X is not None, "activation-based sensitivity needs stored X"
+    ntok = X.shape[1]
+    s2 = sensitivity.value()
 
-
-def gelu_prime(z: torch.Tensor) -> torch.Tensor:
-    """tanh-approx GELU derivative, for any GeGLU model (e.g. Gemma)."""
-    c = 0.7978845608028654  # sqrt(2/pi)
-    k = 0.044715
-    inner = c * (z + k * z.pow(3))
-    t = torch.tanh(inner)
-    dt = (1.0 - t.pow(2)) * c * (1.0 + 3.0 * k * z.pow(2))
-    return 0.5 * (1.0 + t) + 0.5 * z * dt
-
-
-def gelu(z: torch.Tensor) -> torch.Tensor:
-    c = 0.7978845608028654
-    k = 0.044715
-    return 0.5 * z * (1.0 + torch.tanh(c * (z + k * z.pow(3))))
-
-
-_ACT_VALUE = {"silu": silu, "gelu": gelu}
-_ACT_SLOPE = {"silu": silu_prime, "gelu": gelu_prime}
+    def score_fn(E):
+        act = metric.activation_score(E, X, s2, gidx, n_groups, ntok)
+        if lam > 0.0:
+            w = metric.weight_score(E, gidx, n_groups)
+            return (1.0 - lam) * w + lam * act
+        return act
+    return score_fn
 
 
 # --------------------------------------------------------------------------
-# Sensitivity providers
+# SwiGLU block coupler
 # --------------------------------------------------------------------------
-class Sensitivity:
-    """Produces s^2_{i,t} for a layer. Subclasses set .kind and .value()."""
-
-    #: one of {"scalar", "per_token", "per_row_token"}
-    kind = "scalar"
-
-    def value(self) -> object:
-        """Return 1.0 (scalar), (n_tok,) tensor, or (d_out, n_tok) tensor."""
-        raise NotImplementedError
-
-
-class ConstantSensitivity(Sensitivity):
-    """M_2 linear response:  s^2_{i,t} = 1  (Corollary 1, identity case)."""
-    kind = "scalar"
-
-    def value(self):
-        return 1.0
-
-
-class PointwiseSensitivity(Sensitivity):
+class SwiGLUBlock:
     """
-    M_sigma pointwise post-activation:  s^2_{i,t} = sigma'(w_i^T x_t)^2.
-    Per-row because the pre-activation a_{i,t}=w_i^T x_t differs by row.
-    For a SwiGLU gate viewed in isolation this is the OLD (incomplete) gate
-    metric: it lacks the u_{k,t}^2 factor. Kept as a baseline tier.
+    Holds the gate/up/down weights and stored X for one MLP block, computes the
+    shared linear responses g, u once, and builds the correct score_fn for the
+    gate and up layers respectively.
+
+    Usage (driver side):
+        blk = SwiGLUBlock(Wg, Wu, Wd, Xg, Xu, act="silu", use_rho=True)
+        gate_score = blk.gate_score_fn(group_size, lam)
+        up_score   = blk.up_score_fn(group_size, lam)
+    Xg and Xu are the inputs feeding gate and up. In SwiGLU they are the SAME
+    tensor (both read the post-attention layernorm output), so a single X is
+    fine; we keep them separate only to be defensive about hook capture.
     """
-    kind = "per_row_token"
 
-    def __init__(self, A: torch.Tensor, act: str = "silu"):
-        # A = W @ X, shape (d_out, n_tok); the layer's own linear response.
-        slope = _ACT_SLOPE[act.lower()]
-        self._s2 = slope(A).pow(2)  # (d_out, n_tok)
+    def __init__(self, Wg: torch.Tensor, Wu: torch.Tensor,
+                 Wd: torch.Tensor, X: torch.Tensor,
+                 act: str = "silu", use_rho: bool = True):
+        self.Wg = Wg.float()
+        self.Wu = Wu.float()
+        self.X = X                              # (d_model, n_tok)
+        self.act = act
+        # Shared linear responses on the intermediate axis.
+        self.g = self.Wg @ self.X               # (d_inter, n_tok)
+        self.u = self.Wu @ self.X               # (d_inter, n_tok)
+        self.rho = sens.downstream_gain(Wd) if use_rho else None  # (d_inter,)
 
-    def value(self):
-        return self._s2
+    def gate_score_fn(self, group_size: int, lam: float = 0.0) -> ScoreFn:
+        s = sens.GateSensitivity(self.g, self.u, rho=self.rho, act=self.act)
+        return build_score_fn(self.Wg, group_size=group_size, X=self.X,
+                              sensitivity=s, lam=lam)
 
-
-class GateSensitivity(Sensitivity):
-    """
-    SwiGLU gate metric (Eq. 11, optionally Eq. 14 with rho):
-        s^2_{k,t} = rho_k * u_{k,t}^2 * SiLU'(g_{k,t})^2
-    Needs BOTH g = W_g X (own response) and u = W_u X (sibling response).
-    """
-    kind = "per_row_token"
-
-    def __init__(self, g: torch.Tensor, u: torch.Tensor,
-                 rho: torch.Tensor | None = None, act: str = "silu"):
-        # g, u : (d_inter, n_tok). rho : (d_inter,) or None.
-        slope = _ACT_SLOPE[act.lower()]
-        s2 = u.pow(2) * slope(g).pow(2)              # (d_inter, n_tok)
-        if rho is not None:
-            s2 = s2 * rho.unsqueeze(1)               # broadcast over tokens
-        self._s2 = s2
-
-    def value(self):
-        return self._s2
-
-
-class UpSensitivity(Sensitivity):
-    """
-    SwiGLU up metric (Eq. 13, optionally Eq. 14 with rho):
-        s^2_{k,t} = rho_k * SiLU(g_{k,t})^2
-    Needs the SIBLING gate response g = W_g X; the up layer never sees it
-    locally.
-    """
-    kind = "per_row_token"
-
-    def __init__(self, g: torch.Tensor,
-                 rho: torch.Tensor | None = None, act: str = "silu"):
-        act_fn = _ACT_VALUE[act.lower()]
-        s2 = act_fn(g).pow(2)                        # (d_inter, n_tok)
-        if rho is not None:
-            s2 = s2 * rho.unsqueeze(1)
-        self._s2 = s2
-
-    def value(self):
-        return self._s2
-
-
-def downstream_gain(W_down: torch.Tensor) -> torch.Tensor:
-    """
-    rho_k = ||W_d^{(:,k)}||^2  (Eq. 14). W_down is the down_proj weight of shape
-    (d_model, d_inter); column k feeds intermediate channel k, which is exactly
-    output row k of gate/up. Returns (d_inter,).
-    """
-    return W_down.float().pow(2).sum(dim=0)  # sum over d_model -> (d_inter,)
+    def up_score_fn(self, group_size: int, lam: float = 0.0) -> ScoreFn:
+        s = sens.UpSensitivity(self.g, rho=self.rho, act=self.act)
+        return build_score_fn(self.Wu, group_size=group_size, X=self.X,
+                              sensitivity=s, lam=lam)
