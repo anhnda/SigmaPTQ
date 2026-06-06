@@ -36,36 +36,65 @@ def get_wikitext2_testenc(tokenizer):
     return tokenizer(text, return_tensors="pt").input_ids
 
 
-def get_c4_testenc(tokenizer, n_samples, seqlen, seed):
+def get_c4_testenc(tokenizer, n_samples, seqlen, seed, cache_dir="./dataset_cache"):
     """
     C4 has no fixed test perplexity split convention; follow GPTQ/AWQ: draw
     n_samples random seqlen-length windows from the validation stream and
     concatenate. Deterministic under seed.
+
+    Streamed: we iterate the validation shard lazily and stop as soon as we
+    have n_samples windows, so we never download/materialize all 8 shards.
+
+    Cached: the resulting (1, n_samples*seqlen) token tensor is saved as a .pt
+    keyed by (tokenizer, n_samples, seqlen, seed). Subsequent runs with the same
+    key skip streaming and tokenization entirely.
     """
+    import hashlib
     from datasets import load_dataset
     import random
-    try:
-        val = load_dataset(
-            "allenai/c4", "en",
-            data_files={"validation": "en/c4-validation.00000-of-00008.json.gz"},
-            split="validation")
-    except Exception:
-        # newer mirror layout
-        val = load_dataset("allenai/c4", "en", split="validation",
-                           streaming=False)
+
+    # Cache key includes tokenizer identity so different models don't collide.
+    tok_id = getattr(tokenizer, "name_or_path", "") or type(tokenizer).__name__
+    vocab = getattr(tokenizer, "vocab_size", 0)
+    key = f"{tok_id}|{vocab}|n{n_samples}|L{seqlen}|s{seed}"
+    h = hashlib.md5(key.encode()).hexdigest()[:12]
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_file = os.path.join(cache_dir, f"c4_testenc_{h}.pt")
+
+    if os.path.exists(cache_file):
+        print(f"  [c4] loading cached windows: {cache_file}")
+        return torch.load(cache_file)
+
+    # Stream a single validation shard; lazy, no full download.
+    val = load_dataset(
+        "allenai/c4", "en",
+        data_files={"validation": "en/c4-validation.00000-of-00008.json.gz"},
+        split="validation",
+        streaming=True,
+    )
+
     rng = random.Random(seed)
     chunks = []
-    tries = 0
-    while len(chunks) < n_samples and tries < n_samples * 50:
-        tries += 1
-        i = rng.randint(0, len(val) - 1)
-        enc = tokenizer(val[i]["text"], return_tensors="pt").input_ids
+    # Skip a deterministic, seed-dependent number of leading docs so different
+    # seeds see different windows without needing random access.
+    skip = rng.randint(0, 2000)
+    for idx, item in enumerate(tqdm(val, desc="c4 stream", unit="doc",
+                                    leave=False)):
+        if idx < skip:
+            continue
+        if len(chunks) >= n_samples:
+            break
+        enc = tokenizer(item["text"], return_tensors="pt").input_ids
         if enc.shape[1] >= seqlen:
             start = rng.randint(0, enc.shape[1] - seqlen)
             chunks.append(enc[:, start:start + seqlen])
+
     if not chunks:
         raise RuntimeError("C4: no sample reached seqlen; lower --seqlen.")
-    return torch.cat(chunks, dim=1)
+    enc = torch.cat(chunks, dim=1)
+    torch.save(enc, cache_file)
+    print(f"  [c4] cached windows -> {cache_file}")
+    return enc
 
 
 @torch.no_grad()
@@ -104,6 +133,8 @@ def main():
     p.add_argument("--c4-samples", type=int, default=256,
                    help="number of seqlen windows drawn for C4.")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--cache-dir", type=str, default="./dataset_cache",
+                   help="dir for cached C4 token windows.")
     p.add_argument("--out", type=str, default=None,
                    help="JSON path; default <model-path>/ppl.json")
     args = p.parse_args()
@@ -130,7 +161,8 @@ def main():
         if ds == "wikitext2":
             enc = get_wikitext2_testenc(tok)
         else:
-            enc = get_c4_testenc(tok, args.c4_samples, args.seqlen, args.seed)
+            enc = get_c4_testenc(tok, args.c4_samples, args.seqlen, args.seed,
+                                 cache_dir=args.cache_dir)
         ppl = perplexity(model, enc, args.seqlen, device)
         results["ppl"][ds] = ppl
         print(f"[{ds}] perplexity = {ppl:.4f}")
