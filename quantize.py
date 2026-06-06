@@ -337,7 +337,7 @@ def main():
     p.add_argument("--clip-range", type=str, default="linear_response",
                    choices=["rtn", "weight_mse", "linear_response", "mixed", "sigma_aware"])
     p.add_argument("--inner", type=str, default="linear", choices=["linear", "sigma"])
-    p.add_argument("--lam", type=float, default=0.5)
+    p.add_argument("--lam", type=float, default=1)
     p.add_argument("--grid-min", type=float, default=0.5)
     p.add_argument("--grid-max", type=float, default=1.0)
 

@@ -33,10 +33,9 @@ Qwen2.5 /home/DATA/prometheus/anh/.cache/huggingface/hub/models--Qwen--Qwen2.5-7
 Llama 3.1.
 3bits:
 Llama Sigma vs Linear
-Dataset         Heuristic PTQ   Standard PTQ    Delta        Winner                                           
---------------------------------------------------------------------------------                              
-WikiText-2      8.4249          8.4569               -0.378%  Tie                                             
-C4              14.6398         14.7111              -0.485%  Heuristic                                       
+WikiText-2      8.6656          8.7217               -0.643%  Heuristic 
+C4              14.2707         14.3298              -0.412%  Heuristic 
+
 
 Mistral:
 Dataset         Heuristic PTQ   Standard PTQ    Delta        Winner                                                                        
@@ -44,7 +43,13 @@ Dataset         Heuristic PTQ   Standard PTQ    Delta        Winner
 WikiText-2      5.6774          5.6909               -0.236%  Tie                                                                          
 C4              8.7108          8.7292               -0.211%  Tie                                                                          
                                                                       
-                                                                      
+Qwen2.5:
+                                                                                                                                                                     
+Dataset         Heuristic PTQ   Standard PTQ    Delta        Winner                                                                                                  
+--------------------------------------------------------------------------------                                                                                     
+WikiText-2      8.1420          8.2536               -1.352%  Heuristic                                                                                              
+C4              13.6412         13.8372              -1.417%  Heuristic                                                                                              
+                                                                                                                                                     
 
 RTN
 Dataset         Model                Perplexity      Total Tokens   
