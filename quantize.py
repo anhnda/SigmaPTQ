@@ -362,8 +362,10 @@ def main():
                             "pointwise", "gated", "mixed"])
     p.add_argument("--lam", type=float, default=0.0,
                    help="identity floor for mixed/pointwise: (1-lam)I + lam*M.")
-    p.add_argument("--use-rho", dest="use_rho", action="store_true", default=True,
-                   help="apply downstream gain rho_k=||W_d^{(:,k)}||^2 (Eq.14).")
+    p.add_argument("--use-rho", dest="use_rho", action="store_true", default=False,
+                   help="apply downstream gain rho_k=||W_d^{(:,k)}||^2 (Eq.14). "
+                        "Default OFF: M1 showed rho weakens hidden-level "
+                        "candidate ranking; it is an ablation arm, not primary.")
     p.add_argument("--no-rho", dest="use_rho", action="store_false")
     p.add_argument("--power", type=int, default=2, choices=[1, 2],
                    help="C1 ablation: 2 -> XS^2X^T (correct); 1 -> XSX^T control.")
