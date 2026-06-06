@@ -1,17 +1,17 @@
 """
-Cross-Dataset Validation: PTQ Methods with Sliding Window Evaluation (FINAL CORRECTED)
+Cross-Dataset Validation: PTQ Methods with Sliding Window Evaluation (FINAL CORRECTED + BATCHED)
 
 Fixes:
 1. Sliding Window Math: Now uses correct context masking (labels=-100).
 2. Llama 3 BOS: Manually handles BOS to prevent "Double BOS" (PPL 15.5 -> 6.2).
 3. Tokenizer: Removed fix_mistral_regex kwarg entirely — causes "multiple values"
    error on Llama-3 and some tokenizers versions. Warning is cosmetic and harmless.
+4. Batched windows: Multiple windows processed per forward pass. PPL estimator
+   is identical (manual CrossEntropyLoss reduction='none', global NLL/token sums).
 
 Metric: loglikelihood_rolling (Standard lm-evaluation-harness methodology)
 Stride: 512 tokens
 """
-
-from html import parser
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -25,21 +25,24 @@ from pathlib import Path
 
 
 class PTQSlidingWindowValidator:
-    def __init__(self, device="cuda", seed=42, stride=512, max_length=2048, cache_dir="./dataset_cache"):
+    def __init__(self, device="cuda", seed=42, stride=512, max_length=2048,
+                 cache_dir="./dataset_cache", batch_size=8):
         self.device = device
         self.seed = seed
         self.stride = stride
         self.max_length = max_length
+        self.batch_size = batch_size
         self.results = {}
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
 
         print("=" * 80)
-        print("PTQ SLIDING WINDOW CROSS-DATASET VALIDATION (FINAL)")
+        print("PTQ SLIDING WINDOW CROSS-DATASET VALIDATION (FINAL + BATCHED)")
         print("=" * 80)
         print(f"Device: {device}")
         print(f"Stride: {stride}")
         print(f"Max Seq Length: {max_length}")
+        print(f"Batch Size: {batch_size}")
         print(f"Cache Dir: {cache_dir}")
         print("=" * 80)
 
@@ -129,14 +132,25 @@ class PTQSlidingWindowValidator:
         return result
 
     # ------------------------------------------------------------------
-    # Core evaluation
+    # Core evaluation (BATCHED)
     # ------------------------------------------------------------------
 
     @torch.no_grad()
     def evaluate_sliding_window(self, model, tokenizer, texts):
-        """Final Corrected Sliding Window Evaluation."""
+        """
+        Batched sliding window evaluation.
+
+        Mathematically identical to the per-window version:
+          - Each window scores exactly `trg_len` tokens (the new tokens since the
+            previous window), context tokens masked to -100.
+          - Global NLL sum and global token count, exp(total_nll/total_tokens) at end.
+        Only difference: windows are grouped into batches of `self.batch_size`
+        and run through a single forward pass. Loss is computed manually with
+        reduction='none' so per-window trg_len accounting is exact and unaffected
+        by padding or batch averaging.
+        """
         model.eval()
-        nlls = []
+        total_nll = 0.0   # float accumulation — no per-window GPU sync
         total_tokens = 0
 
         for text in texts:
@@ -148,12 +162,12 @@ class PTQSlidingWindowValidator:
             print(f"  tokenizer class: {type(tokenizer).__name__}")
 
             # Manual BOS injection — Llama 3 requires ID 128000 at position 0
-            # Manual BOS injection — Llama 3 requires ID 128000 at position 0
             # Skip for Qwen2.5/GPT-2-style where bos==eos (endoftext), injecting it hurts stream PPL
             if tokenizer.bos_token_id is not None and tokenizer.bos_token_id != tokenizer.eos_token_id:
                 if input_ids.shape[1] == 0 or input_ids[0, 0].item() != tokenizer.bos_token_id:
                     bos_tensor = torch.tensor([[tokenizer.bos_token_id]], device=input_ids.device)
                     input_ids = torch.cat([bos_tensor, input_ids], dim=1)
+
             # Safety cap: max_length * 200 tokens (~280k for WikiText-2 full test set)
             if input_ids.size(1) > self.max_length * 200:
                 input_ids = input_ids[:, : self.max_length * 200]
@@ -164,54 +178,91 @@ class PTQSlidingWindowValidator:
             if seq_len < 2:
                 continue
 
-            window_range = list(range(0, seq_len, self.stride))
-            num_windows = len(window_range)
-            print(f"  Processing {seq_len:,} tokens in {num_windows} windows...")
-
-            
-            pbar = tqdm(window_range, desc="  Windows", unit="win", leave=False)
-
+            # ---- Pre-compute all windows for this text ----
+            # Each entry: (begin_loc, end_loc, trg_len) — same logic as the
+            # original sequential loop, so the set of scored tokens is identical.
+            windows = []
             prev_end_loc = 0
-            evaluated_tokens = 0  # ← ADD THIS
-
-            for begin_loc in pbar:
+            for begin_loc in range(0, seq_len, self.stride):
                 end_loc = min(begin_loc + self.max_length, seq_len)
                 trg_len = end_loc - prev_end_loc
-
-                input_chunk = input_ids[:, begin_loc:end_loc]
-                target_chunk = input_chunk.clone()
-
-                if begin_loc > 0:
-                    target_chunk[:, :-trg_len] = -100
-
-                if target_chunk.size(1) == 0:
+                if trg_len <= 0:
                     break
-
-                with torch.no_grad():
-                    outputs = model(input_chunk, labels=target_chunk)
-                    neg_log_likelihood = outputs.loss * trg_len
-
-                nlls.append(neg_log_likelihood)
+                windows.append((begin_loc, end_loc, trg_len))
                 prev_end_loc = end_loc
-                evaluated_tokens += trg_len  # ← ADD THIS
-
-                # Fix 2 — live PPL: replace (total_tokens + prev_end_loc) 
-                if nlls:
-                    current_nll = torch.stack(nlls).sum()
-                    current_ppl = torch.exp(current_nll / (total_tokens + evaluated_tokens)).item()  # ← CHANGE THIS
-                    pbar.set_postfix({"PPL": f"{current_ppl:.4f}", "tokens": f"{total_tokens + evaluated_tokens:,}"})  # ← AND THIS
-
                 if end_loc == seq_len:
                     break
 
-            total_tokens += evaluated_tokens  # ← CHANGE FROM seq_len TO evaluated_tokens
+            num_windows = len(windows)
+            print(f"  Processing {seq_len:,} tokens in {num_windows} windows "
+                  f"(batch_size={self.batch_size})...")
 
-        if not nlls:
+            pad_id = tokenizer.pad_token_id
+            if pad_id is None:
+                pad_id = tokenizer.eos_token_id
+
+            pbar = tqdm(range(0, num_windows, self.batch_size),
+                        desc="  Batches", unit="batch", leave=False)
+
+            for batch_start in pbar:
+                batch_windows = windows[batch_start: batch_start + self.batch_size]
+
+                # Right-pad windows to the longest in this batch.
+                chunks = [input_ids[:, b:e] for (b, e, _) in batch_windows]
+                max_len = max(c.size(1) for c in chunks)
+                bsz = len(chunks)
+
+                batch_input = torch.full(
+                    (bsz, max_len), pad_id, dtype=torch.long, device=self.device,
+                )
+                batch_labels = torch.full(
+                    (bsz, max_len), -100, dtype=torch.long, device=self.device,
+                )
+                attn_mask = torch.zeros(
+                    (bsz, max_len), dtype=torch.long, device=self.device,
+                )
+
+                for i, (chunk, (b, e, trg_len)) in enumerate(zip(chunks, batch_windows)):
+                    clen = chunk.size(1)
+                    batch_input[i, :clen] = chunk[0]
+                    attn_mask[i, :clen] = 1
+                    # Score only the last trg_len real tokens of this window
+                    lbl = chunk.clone()
+                    lbl[:, :-trg_len] = -100
+                    batch_labels[i, :clen] = lbl[0]
+
+                outputs = model(batch_input, attention_mask=attn_mask)
+                logits = outputs.logits  # [B, T, V]
+
+                # Manual shift + per-token loss. HF's built-in `labels=` loss
+                # averages over the whole batch, mixing windows of different
+                # trg_len — so we compute it ourselves and sum globally.
+                shift_logits = logits[:, :-1, :].contiguous()
+                shift_labels = batch_labels[:, 1:].contiguous()
+
+                loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
+                flat_loss = loss_fct(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                )  # ignored (-100) positions contribute exactly 0
+
+                batch_nll = flat_loss.sum().item()
+                batch_tok = int((shift_labels != -100).sum().item())
+
+                total_nll += batch_nll
+                total_tokens += batch_tok
+
+                if total_tokens > 0:
+                    current_ppl = float(np.exp(total_nll / total_tokens))
+                    pbar.set_postfix({
+                        "PPL": f"{current_ppl:.4f}",
+                        "tokens": f"{total_tokens:,}",
+                    })
+
+        if total_tokens == 0:
             return None
 
-        total_nll = torch.stack(nlls).sum()
-        perplexity = torch.exp(total_nll / total_tokens).item()
-
+        perplexity = float(np.exp(total_nll / total_tokens))
         return {"perplexity": perplexity, "total_tokens": total_tokens}
 
     # ------------------------------------------------------------------
@@ -258,7 +309,7 @@ class PTQSlidingWindowValidator:
                 trust_remote_code=True,
             )
             print(f"model.dtype={model.dtype}")
-            print(f"max_length={self.max_length}  stride={self.stride}")
+            print(f"max_length={self.max_length}  stride={self.stride}  batch_size={self.batch_size}")
             print(f"BOS={tokenizer.bos_token_id}  EOS={tokenizer.eos_token_id}")
             results = self.evaluate_sliding_window(model, tokenizer, texts)
 
@@ -452,15 +503,18 @@ def main():
     parser.add_argument("--cache-dir", type=str, default="./dataset_cache",
                         help="Directory to cache downloaded datasets")
     parser.add_argument("--max-length", type=int, default=2048,
-                    help="Max sequence length per window")
+                        help="Max sequence length per window")
     parser.add_argument("--stride", type=int, default=512,
-                    help="Stride between windows")
+                        help="Stride between windows")
+    parser.add_argument("--batch-size", type=int, default=8,
+                        help="Number of windows per forward pass")
     args = parser.parse_args()
 
     validator = PTQSlidingWindowValidator(
         cache_dir=args.cache_dir,
         max_length=args.max_length,
         stride=args.stride,
+        batch_size=args.batch_size,
     )
     validator.run_validation(
         args.heuristic_path,
@@ -489,4 +543,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()    
