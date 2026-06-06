@@ -45,7 +45,6 @@ for MODEL_NAME in mistral7b qwen25 llama31; do
         --lam 1 \
         --bits 3 \
         --group-size 128 \
-        --n-calib 128 \
         --output-dir "$SIGMA_DIR"
 
     echo "[3/4] Comparing"
