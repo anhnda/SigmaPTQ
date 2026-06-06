@@ -241,7 +241,11 @@ def quantize_xstore_backend(model, tokenizer, calib_texts, linear_layers,
                         Wu = u_mod.weight.data.float()
                         Wd = d_mod.weight.data.float()
                         blk = SwiGLUBlock(Wg, Wu, Wd, Xshared,
-                                          act="silu", use_rho=args.use_rho)
+                                          act="silu", use_rho=args.use_rho,
+                                          power=args.power,
+                                          random_seed=(args.seed
+                                                       if args.random_sens
+                                                       else None))
                         lam = args.lam if args.metric == "mixed" else 0.0
                         # gate
                         s_g = blk.gate_score_fn(gs, lam)
@@ -361,6 +365,12 @@ def main():
     p.add_argument("--use-rho", dest="use_rho", action="store_true", default=True,
                    help="apply downstream gain rho_k=||W_d^{(:,k)}||^2 (Eq.14).")
     p.add_argument("--no-rho", dest="use_rho", action="store_false")
+    p.add_argument("--power", type=int, default=2, choices=[1, 2],
+                   help="C1 ablation: 2 -> XS^2X^T (correct); 1 -> XSX^T control.")
+    p.add_argument("--random-sens", dest="random_sens", action="store_true",
+                   default=False,
+                   help="C3 ablation: replace gate/up sensitivity with a "
+                        "scale-matched random positive field.")
     p.add_argument("--grid-min", type=float, default=0.5)
     p.add_argument("--grid-max", type=float, default=1.0)
     p.add_argument("--bits", type=int, default=3, choices=[2, 3, 4])
@@ -387,7 +397,8 @@ def main():
     from transformers import AutoModelForCausalLM, AutoTokenizer
     print("=" * 78)
     print(f"NAC PTQ | metric={args.metric} | bits={args.bits} "
-          f"| group={args.group_size} | rho={args.use_rho}")
+          f"| group={args.group_size} | rho={args.use_rho} "
+          f"| power={args.power} | random_sens={args.random_sens}")
     print("Model:", args.model_path, "| device:", args.device)
     print("=" * 78)
 

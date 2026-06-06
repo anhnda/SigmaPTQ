@@ -115,12 +115,17 @@ class GateSensitivity(Sensitivity):
     kind = "per_row_token"
 
     def __init__(self, g: torch.Tensor, u: torch.Tensor,
-                 rho: torch.Tensor | None = None, act: str = "silu"):
+                 rho: torch.Tensor | None = None, act: str = "silu",
+                 power: int = 2):
         # g, u : (d_inter, n_tok). rho : (d_inter,) or None.
+        # power=2 -> XS^2X^T (correct, Eq.11); power=1 -> XSX^T (C1 control).
         slope = _ACT_SLOPE[act.lower()]
-        s2 = u.pow(2) * slope(g).pow(2)              # (d_inter, n_tok)
+        base = (u.abs() * slope(g).abs())            # |s|_{k,t}, the raw magnitude
+        s2 = base.pow(power)                         # |s|^power
         if rho is not None:
-            s2 = s2 * rho.unsqueeze(1)               # broadcast over tokens
+            # rho is a squared gain; apply rho^(power/2) so it scales like the
+            # base term (rho^1 with power=2, sqrt(rho) with power=1).
+            s2 = s2 * rho.pow(power / 2.0).unsqueeze(1)
         self._s2 = s2
 
     def value(self):
@@ -132,17 +137,49 @@ class UpSensitivity(Sensitivity):
     SwiGLU up metric (Eq. 13, optionally Eq. 14 with rho):
         s^2_{k,t} = rho_k * SiLU(g_{k,t})^2
     Needs the SIBLING gate response g = W_g X; the up layer never sees it
-    locally.
+    locally. power=1 gives the XSX^T control for ablation C1.
     """
     kind = "per_row_token"
 
     def __init__(self, g: torch.Tensor,
-                 rho: torch.Tensor | None = None, act: str = "silu"):
+                 rho: torch.Tensor | None = None, act: str = "silu",
+                 power: int = 2):
         act_fn = _ACT_VALUE[act.lower()]
-        s2 = act_fn(g).pow(2)                        # (d_inter, n_tok)
+        base = act_fn(g).abs()                       # |SiLU(g)|_{k,t}
+        s2 = base.pow(power)
         if rho is not None:
-            s2 = s2 * rho.unsqueeze(1)
+            s2 = s2 * rho.pow(power / 2.0).unsqueeze(1)
         self._s2 = s2
+
+    def value(self):
+        return self._s2
+
+
+class ScaleMatchedRandomSensitivity(Sensitivity):
+    """
+    C3 control: replace s^2_{k,t} with RANDOM positive weights, to rule out
+    "any reweighting helps." The random field is matched to a reference
+    sensitivity in (a) per-row mean and (b) overall mean, so the ablation
+    isolates the *structure* of the sensitivity, not its scale.
+
+    Given a reference s2_ref of shape (d_inter, n_tok), draw r ~ Exp(1) of the
+    same shape and rescale each row so its mean equals the reference row mean.
+    Exp(1) gives a positive, heavy-ish-tailed field with nontrivial spread
+    (so this is not "uniform = identity in disguise").
+    """
+    kind = "per_row_token"
+
+    def __init__(self, s2_ref: torch.Tensor, seed: int = 0):
+        gen = torch.Generator(device=s2_ref.device)
+        gen.manual_seed(seed)
+        # Exp(1) via inverse-CDF of U(0,1): -log(1-U).
+        u = torch.rand(s2_ref.shape, generator=gen, device=s2_ref.device,
+                       dtype=s2_ref.dtype).clamp(min=1e-12, max=1.0 - 1e-12)
+        r = -torch.log1p(-u)                          # Exp(1), (d_inter, n_tok)
+        row_mean_ref = s2_ref.mean(dim=1, keepdim=True).clamp(min=1e-20)
+        row_mean_r = r.mean(dim=1, keepdim=True).clamp(min=1e-20)
+        self._s2 = r * (row_mean_ref / row_mean_r)    # per-row scale match
+        self.kind = "per_row_token"
 
     def value(self):
         return self._s2

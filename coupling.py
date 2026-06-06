@@ -91,22 +91,34 @@ class SwiGLUBlock:
 
     def __init__(self, Wg: torch.Tensor, Wu: torch.Tensor,
                  Wd: torch.Tensor, X: torch.Tensor,
-                 act: str = "silu", use_rho: bool = True):
+                 act: str = "silu", use_rho: bool = True,
+                 power: int = 2, random_seed: int | None = None):
         self.Wg = Wg.float()
         self.Wu = Wu.float()
         self.X = X                              # (d_model, n_tok)
         self.act = act
+        self.power = power                      # 2 -> XS^2X^T; 1 -> XSX^T (C1)
+        self.random_seed = random_seed          # not None -> C3 random baseline
         # Shared linear responses on the intermediate axis.
         self.g = self.Wg @ self.X               # (d_inter, n_tok)
         self.u = self.Wu @ self.X               # (d_inter, n_tok)
         self.rho = sens.downstream_gain(Wd) if use_rho else None  # (d_inter,)
 
     def gate_score_fn(self, group_size: int, lam: float = 0.0) -> ScoreFn:
-        s = sens.GateSensitivity(self.g, self.u, rho=self.rho, act=self.act)
+        s = sens.GateSensitivity(self.g, self.u, rho=self.rho, act=self.act,
+                                 power=self.power)
+        if self.random_seed is not None:
+            # Scale-matched random field referencing the true gate sensitivity.
+            s = sens.ScaleMatchedRandomSensitivity(s.value(),
+                                                   seed=self.random_seed)
         return build_score_fn(self.Wg, group_size=group_size, X=self.X,
                               sensitivity=s, lam=lam)
 
     def up_score_fn(self, group_size: int, lam: float = 0.0) -> ScoreFn:
-        s = sens.UpSensitivity(self.g, rho=self.rho, act=self.act)
+        s = sens.UpSensitivity(self.g, rho=self.rho, act=self.act,
+                               power=self.power)
+        if self.random_seed is not None:
+            s = sens.ScaleMatchedRandomSensitivity(s.value(),
+                                                   seed=self.random_seed + 1)
         return build_score_fn(self.Wu, group_size=group_size, X=self.X,
                               sensitivity=s, lam=lam)
