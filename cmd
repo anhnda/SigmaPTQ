@@ -43,3 +43,9 @@ Dataset         Model                Perplexity      Total Tokens
 ----------------------------------------------------------------------
 WikiText-2      Heuristic PTQ        20.5069         288,937        
 C4              Heuristic PTQ        33.4816         291,381    
+
+CR-0.85
+Dataset         Model                Perplexity      Total Tokens   
+----------------------------------------------------------------------
+WikiText-2      Heuristic PTQ        17.6137         288,937        
+C4              Heuristic PTQ        29.6928         291,381        
