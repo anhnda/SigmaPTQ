@@ -16,7 +16,7 @@ MODELS["llama31"]="/home/DATA/prometheus/anh/.cache/huggingface/hub/models--meta
 MODELS["mistral7b"]="/home/DATA/prometheus/anh/.cache/huggingface/hub/models--mistralai--Mistral-7B-v0.3/snapshots/caa1feb0e54d415e2df31207e5f4e273e33509b1"
 MODELS["qwen25"]="/home/DATA/prometheus/anh/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B/snapshots/d149729398750b98c0af14eb82c78cfe92750796"
 
-for MODEL_NAME in mistral7b qwen25 llama31; do
+for MODEL_NAME in qwen25 llama31; do
     MODEL_PATH="${MODELS[$MODEL_NAME]}"
 
     LINEAR_DIR="./quantized_models/${MODEL_NAME}_linear"

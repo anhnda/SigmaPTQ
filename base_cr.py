@@ -10,6 +10,14 @@ eff = min(group_maxabs, c) the clip could only bite the largest group per row.
 Now c has shape (d_out, n_groups, 1) and each group's clip is chosen
 independently.
 
+MEMORY FIX: the activation-based scores (LinearResponse, Mixed, SigmaAware)
+no longer materialize the dense partial-products tensor
+U of shape (d_out, n_groups, n_tok). For Qwen2.5-7B down_proj
+(d_out=18944, n_groups=148, n_tok=4096) that single fp32 tensor is ~46 GiB.
+Instead each group's (d_out, n_tok) partial is reduced to (d_out,) inside the
+group loop and discarded, dropping peak from d_out*n_groups*n_tok to
+d_out*n_tok (an n_groups-fold reduction).
+
 Clip selection is still METRIC SELECTION (Sigma-Aware PTQ paper, Eq. 5):
 
     c* = argmin_c  e(c)^T M e(c),     e(c) = Q_c(w) - w
@@ -25,13 +33,10 @@ Quadratic forms, per row r, per group gp (channels j in group gp):
   SigmaAware      : (1/N) sum_t s_{r,t}^2 ( sum_{j in gp} e_{r,j} x_{j,t} )^2
   Mixed(sigma)    : (1-lam)*weight_gp + lam*sigma_gp (shared mean slope)
 
-Each method's score(E, gidx) returns (d_out, n_groups): the per-group penalty
-of the FULL-row error E restricted to each group's channels. Cross-group
-coupling (a group's clip affecting another group's activation term) is ignored
-by construction — each group's clip only changes that group's channels of e,
-and the metric's cross terms between groups are not part of a single group's
-decision. This matches how the quantizer applies an independent scale per
-group.
+Each method's score(E) returns (d_out, n_groups): the per-group penalty of the
+FULL-row error E restricted to each group's channels. Cross-group coupling is
+ignored by construction, matching how the quantizer applies an independent
+scale per group.
 """
 
 from __future__ import annotations
@@ -130,9 +135,6 @@ class ClipRange:
 
 # ==========================================================================
 # Tier 0 : plain RTN — NO clip search. Clip = per-group max-abs (cf = 1.0).
-#   This is the standard absmax group-wise RTN baseline: every group uses its
-#   own full max-abs as the scale, no clipping. Overrides select_clip to skip
-#   the grid entirely (score() is never called).
 # ==========================================================================
 class PlainRTN(ClipRange):
     name = "rtn"
@@ -174,6 +176,9 @@ class WeightMSE(ClipRange):
 # ==========================================================================
 # Tier 2 : linear-response   M = XX^T/N   (per-group, X backend)
 #   group penalty = (1/N) sum_t ( sum_{j in gp} e_{r,j} x_{j,t} )^2
+#
+# MEMORY FIX: reduce per group inside the loop; never store all groups' tokens.
+# Peak: (d_out, n_tok) per group instead of (d_out, n_groups, n_tok).
 # ==========================================================================
 class LinearResponse(ClipRange):
     name = "linear_response"
@@ -184,30 +189,14 @@ class LinearResponse(ClipRange):
         self.X = X                                       # (d_in, n_tok)
         self.ntok = X.shape[1]
 
-    def _group_partials(self, E):
-        """
-        Returns U_gp of shape (d_out, n_groups, n_tok): the partial pre-activation
-        contribution of each group, u^{gp}_{r,t} = sum_{j in gp} e_{r,j} x_{j,t}.
-        Built by masking E to each group. Memory: d_out * n_groups * n_tok.
-        For large n_groups this is heavy; see batched variant in note below.
-        """
-        d_out, d_in = E.shape
-        # contribution per channel per token then scatter-add into groups:
-        # u^{gp}_{r,t} = sum_j [gidx_j==gp] e_{r,j} x_{j,t}
-        # Compute EX_channel = E_{r,j} * x_{j,t} is (d_out, d_in, n_tok) -- too big.
-        # Instead loop groups (n_groups is small, ~ d_in/128).
-        U = torch.empty(d_out, self.n_groups, self.ntok, device=E.device,
-                        dtype=E.dtype)
+    def score(self, E):
+        d_out = E.shape[0]
+        out = torch.empty(d_out, self.n_groups, device=E.device, dtype=E.dtype)
         for gp in range(self.n_groups):
             mask = (self.gidx == gp)                     # (d_in,)
-            Eg = E[:, mask]                              # (d_out, gsize_gp)
-            Xg = self.X[mask, :]                         # (gsize_gp, n_tok)
-            U[:, gp, :] = Eg @ Xg                        # (d_out, n_tok)
-        return U
-
-    def score(self, E):
-        U = self._group_partials(E)                      # (d_out, G, n_tok)
-        return U.pow(2).sum(dim=2) / self.ntok           # (d_out, G)
+            Ug = E[:, mask] @ self.X[mask, :]            # (d_out, n_tok)
+            out[:, gp] = Ug.pow(2).sum(dim=1) / self.ntok
+        return out                                       # (d_out, n_groups)
 
 
 # ==========================================================================
@@ -236,26 +225,25 @@ class Mixed(ClipRange):
             self.XS = X * s.unsqueeze(0)                 # (d_in, n_tok)
             self.ntok = X.shape[1]
 
-    def _group_partials(self, E, Xmat):
-        d_out = E.shape[0]
-        U = torch.empty(d_out, self.n_groups, self.ntok, device=E.device,
-                        dtype=E.dtype)
-        for gp in range(self.n_groups):
-            mask = (self.gidx == gp)
-            U[:, gp, :] = E[:, mask] @ Xmat[mask, :]
-        return U
-
     def score(self, E):
         weight_term = _scatter_group_sum(E.pow(2), self.gidx, self.n_groups)
         Xmat = self.X if self.inner == "linear" else self.XS
-        U = self._group_partials(E, Xmat)
-        inner_term = U.pow(2).sum(dim=2) / self.ntok
+        d_out = E.shape[0]
+        inner_term = torch.empty(d_out, self.n_groups, device=E.device,
+                                 dtype=E.dtype)
+        for gp in range(self.n_groups):
+            mask = (self.gidx == gp)
+            Ug = E[:, mask] @ Xmat[mask, :]              # (d_out, n_tok)
+            inner_term[:, gp] = Ug.pow(2).sum(dim=1) / self.ntok
         return (1.0 - self.lam) * weight_term + self.lam * inner_term
 
 
 # ==========================================================================
 # Paper method : sigma-aware   M_sigma = X S^2 X^T / N   (per-group, per-row S)
 #   group penalty = (1/N) sum_t s_{r,t}^2 ( sum_{j in gp} e_{r,j} x_{j,t} )^2
+#
+# MEMORY FIX: fold S^2 weighting into the per-group reduction; never store the
+# dense U or the S2*U^2 temporary across all groups.
 # ==========================================================================
 class SigmaAware(ClipRange):
     name = "sigma_aware"
@@ -273,19 +261,15 @@ class SigmaAware(ClipRange):
         self.S = pre_act_fn(A)                            # (d_out, n_tok)
         self.ntok = X.shape[1]
 
-    def _group_partials(self, E):
+    def score(self, E):
         d_out = E.shape[0]
-        U = torch.empty(d_out, self.n_groups, self.ntok, device=E.device,
-                        dtype=E.dtype)
+        S2 = self.S.pow(2)                               # (d_out, n_tok)
+        sigma_term = torch.empty(d_out, self.n_groups, device=E.device,
+                                 dtype=E.dtype)
         for gp in range(self.n_groups):
             mask = (self.gidx == gp)
-            U[:, gp, :] = E[:, mask] @ self.X[mask, :]   # (d_out, n_tok)
-        return U
-
-    def score(self, E):
-        U = self._group_partials(E)                      # (d_out, G, n_tok)
-        S2 = self.S.pow(2).unsqueeze(1)                  # (d_out, 1, n_tok)
-        sigma_term = (S2 * U.pow(2)).sum(dim=2) / self.ntok   # (d_out, G)
+            Ug = E[:, mask] @ self.X[mask, :]            # (d_out, n_tok)
+            sigma_term[:, gp] = (S2 * Ug.pow(2)).sum(dim=1) / self.ntok
         if self.lam > 0.0:
             weight_term = _scatter_group_sum(E.pow(2), self.gidx, self.n_groups)
             return (1.0 - self.lam) * weight_term + self.lam * sigma_term
@@ -311,8 +295,6 @@ def build_clip_range(kind, lam=0.5, inner="linear", n_grid=20,
 
 # ==========================================================================
 # Group-wise quantizer accepting a PER-GROUP clip (d_out, n_groups, 1).
-# Drop-in replacement for groupwise_rtn_symmetric; the clip is now per group
-# instead of per row.
 # ==========================================================================
 @torch.no_grad()
 def groupwise_rtn_symmetric(W: torch.Tensor, clip: torch.Tensor,

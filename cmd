@@ -32,11 +32,19 @@ Qwen2.5 /home/DATA/prometheus/anh/.cache/huggingface/hub/models--Qwen--Qwen2.5-7
 
 Llama 3.1.
 3bits:
-Sigma vs Linear
+Llama Sigma vs Linear
 Dataset         Heuristic PTQ   Standard PTQ    Delta        Winner                                           
 --------------------------------------------------------------------------------                              
 WikiText-2      8.4249          8.4569               -0.378%  Tie                                             
 C4              14.6398         14.7111              -0.485%  Heuristic                                       
+
+Mistral:
+Dataset         Heuristic PTQ   Standard PTQ    Delta        Winner                                                                        
+--------------------------------------------------------------------------------                                                           
+WikiText-2      5.6774          5.6909               -0.236%  Tie                                                                          
+C4              8.7108          8.7292               -0.211%  Tie                                                                          
+                                                                      
+                                                                      
 
 RTN
 Dataset         Model                Perplexity      Total Tokens   
@@ -49,3 +57,5 @@ Dataset         Model                Perplexity      Total Tokens
 ----------------------------------------------------------------------
 WikiText-2      Heuristic PTQ        17.6137         288,937        
 C4              Heuristic PTQ        29.6928         291,381        
+
+
