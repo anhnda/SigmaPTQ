@@ -75,7 +75,7 @@ class ClipRange:
 
     name = "base"
 
-    def __init__(self, n_grid: int = 20, grid_min: float = 0.85, grid_max: float = 1.0):
+    def __init__(self, n_grid: int = 20, grid_min: float = 0.5, grid_max: float = 1.0):
         self.n_grid = n_grid
         self.grid_min = grid_min
         self.grid_max = grid_max
@@ -185,7 +185,7 @@ class LinearResponse(ClipRange):
 class Mixed(ClipRange):
     name = "mixed"
 
-    def __init__(self, lam=0.5, inner="linear", n_grid=20, grid_min=0.85, grid_max=1.0):
+    def __init__(self, lam=0.5, inner="linear", n_grid=20, grid_min=0.5, grid_max=1.0):
         super().__init__(n_grid, grid_min, grid_max)
         self.lam = float(lam)
         self.inner = inner
@@ -229,7 +229,7 @@ class Mixed(ClipRange):
 class SigmaAware(ClipRange):
     name = "sigma_aware"
 
-    def __init__(self, lam=0.0, n_grid=20, grid_min=0.85, grid_max=1.0):
+    def __init__(self, lam=0.0, n_grid=20, grid_min=0.5, grid_max=1.0):
         super().__init__(n_grid, grid_min, grid_max)
         self.lam = float(lam)
 
@@ -262,7 +262,7 @@ class SigmaAware(ClipRange):
 
 
 def build_clip_range(kind, lam=0.5, inner="linear", n_grid=20,
-                     grid_min=0.85, grid_max=1.0):
+                     grid_min=0.5, grid_max=1.0):
     kind = kind.lower()
     if kind == "weight_mse":
         return WeightMSE(n_grid, grid_min, grid_max)
