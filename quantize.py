@@ -189,19 +189,19 @@ def _build_cr_for_layer(name, args):
     """Construct the clip-range object + extra prepare kwargs for a layer."""
     if args.clip_range == "sigma_aware":
         pre_act_fn = make_pre_act_fn(layer_activation(name))
-        cr = build_clip_range("sigma_aware", lam=args.lam, n_grid=args.n_grid)
+        cr = build_clip_range("sigma_aware", lam=args.lam, n_grid=args.n_grid,grid_min=args.grid_min, grid_max=args.grid_max)
         return cr, dict(pre_act_fn=pre_act_fn)
     if args.clip_range == "linear_response":
-        cr = build_clip_range("linear_response", n_grid=args.n_grid)
+        cr = build_clip_range("linear_response", n_grid=args.n_grid, grid_min=args.grid_min, grid_max=args.grid_max)
         return cr, dict()
     if args.clip_range == "mixed":
         if args.inner == "sigma":
             pre_act_fn = make_pre_act_fn(layer_activation(name))
             cr = build_clip_range("mixed", lam=args.lam, inner="sigma",
-                                  n_grid=args.n_grid)
+                                  n_grid=args.n_grid, grid_min=args.grid_min, grid_max=args.grid_max)
             return cr, dict(pre_act_fn=pre_act_fn)
         cr = build_clip_range("mixed", lam=args.lam, inner="linear",
-                              n_grid=args.n_grid)
+                              n_grid=args.n_grid, grid_min=args.grid_min, grid_max=args.grid_max)
         return cr, dict()
     raise ValueError(f"{args.clip_range} should not use the stored-X backend")
 
@@ -246,7 +246,7 @@ def quantize_xstore_backend(model, tokenizer, calib_texts, linear_layers,
                 X = Xt.t().contiguous().to(device)            # (d_in, n_tok)
 
             if X is None:
-                cr = build_clip_range("weight_mse", n_grid=args.n_grid)
+                cr = build_clip_range("weight_mse", n_grid=args.n_grid, grid_min=args.grid_min, grid_max=args.grid_max)
                 cr.prepare(Wf, group_size=gs)
             else:
                 cr, extra = _build_cr_for_layer(name, args)
@@ -288,7 +288,7 @@ def quantize_weight_mse_backend(model, linear_layers, target_names, args):
         W = module.weight.data
         orig_dtype = W.dtype
         Wf = W.float()
-        cr = build_clip_range(args.clip_range, n_grid=args.n_grid)
+        cr = build_clip_range(args.clip_range, n_grid=args.n_grid, grid_min=args.grid_min, grid_max=args.grid_max)
         cr.prepare(Wf, group_size=gs)
         clip = cr.select_clip(Wf, quant_fn)                   # (d_out, G, 1)
         module.weight.data = quant_fn(Wf, clip).to(orig_dtype)
@@ -338,6 +338,9 @@ def main():
                    choices=["rtn", "weight_mse", "linear_response", "mixed", "sigma_aware"])
     p.add_argument("--inner", type=str, default="linear", choices=["linear", "sigma"])
     p.add_argument("--lam", type=float, default=0.5)
+    p.add_argument("--grid-min", type=float, default=0.5)
+    p.add_argument("--grid-max", type=float, default=1.0)
+
     p.add_argument("--bits", type=int, default=4, choices=[3, 4])
     p.add_argument("--group-size", type=int, default=128)
     p.add_argument("--n-grid", type=int, default=20)

@@ -37,4 +37,9 @@ Dataset         Heuristic PTQ   Standard PTQ    Delta        Winner
 --------------------------------------------------------------------------------                              
 WikiText-2      8.4249          8.4569               -0.378%  Tie                                             
 C4              14.6398         14.7111              -0.485%  Heuristic                                       
-                                                                                   
+
+RTN
+Dataset         Model                Perplexity      Total Tokens   
+----------------------------------------------------------------------
+WikiText-2      Heuristic PTQ        20.5069         288,937        
+C4              Heuristic PTQ        33.4816         291,381    
