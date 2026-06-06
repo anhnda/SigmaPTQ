@@ -309,19 +309,32 @@ def m3_block(parts, store, args, device):
 
     def stats(t):
         t = t.flatten().float()
-        qs = torch.quantile(t, torch.tensor([0.0, 0.5, 0.9, 0.99, 1.0],
-                                             device=t.device))
+        mean = t.mean()
+        std = t.std()
+        tmin = t.min()
+        tmax = t.max()
+        # torch.quantile caps input at ~16M elements; subsample for the
+        # interior quantiles (min/max taken exactly above). Quantiles of a
+        # uniform random subsample are unbiased estimates of the full ones.
+        QCAP = 4_000_000
+        if t.numel() > QCAP:
+            idx = torch.randperm(t.numel(), device=t.device)[:QCAP]
+            tq = t[idx]
+        else:
+            tq = t
+        qs = torch.quantile(tq, torch.tensor([0.5, 0.9, 0.99],
+                                             device=tq.device))
         return {
-            "mean": t.mean().item(),
-            "std": t.std().item(),
-            "min": qs[0].item(),
-            "median": qs[1].item(),
-            "p90": qs[2].item(),
-            "p99": qs[3].item(),
-            "max": qs[4].item(),
+            "mean": mean.item(),
+            "std": std.item(),
+            "min": tmin.item(),
+            "median": qs[0].item(),
+            "p90": qs[1].item(),
+            "p99": qs[2].item(),
+            "max": tmax.item(),
             # coefficient of variation: spread relative to mean. ~0 => metric
             # has nothing to exploit.
-            "cv": (t.std() / (t.mean().abs() + 1e-12)).item(),
+            "cv": (std / (mean.abs() + 1e-12)).item(),
         }
 
     return {"pointwise_sigma'": stats(pointwise),
