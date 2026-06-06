@@ -1,88 +1,77 @@
 """
-base_cr.py
-==========
-Clip-range selection interface for weight-only group-wise PTQ.
+base_cr_groupwise.py
+====================
+Group-wise clip-range selection for weight-only group-wise PTQ.
 
-Clip selection is cast as METRIC SELECTION (Sigma-Aware PTQ paper, Eq. 5):
+FIX over base_cr.py: the clip candidate is now PER GROUP, matching the
+group-wise quantizer. Previously a single per-row scalar c was searched while
+groupwise_rtn_symmetric quantized per group of `group_size` channels; via
+eff = min(group_maxabs, c) the clip could only bite the largest group per row.
+Now c has shape (d_out, n_groups, 1) and each group's clip is chosen
+independently.
+
+Clip selection is still METRIC SELECTION (Sigma-Aware PTQ paper, Eq. 5):
 
     c* = argmin_c  e(c)^T M e(c),     e(c) = Q_c(w) - w
 
-The entire design space is the PSD metric M. This module provides:
+but the argmin is now per (row, group): the score is reduced over the
+group_size channels of each group, leaving the other groups' channels at zero
+contribution for that group's decision.
 
-  Tier 1  WeightMSE       M = I                       (penalize ||e||^2)
-  Tier 2  LinearResponse  M = (1/N) X X^T             (penalize delta of W x)
-  Tier 3  Mixed           M = (1-lam) I + lam (XX^T)  (weight-space floor)
-  Paper   SigmaAware      M = (1/N) X S^2 X^T         (penalize delta of sigma(Wx))
-          FlooredSigma    M = (1-lam) I + lam (X S^2 X^T)   [SigmaAware, lam>0]
+Quadratic forms, per row r, per group gp (channels j in group gp):
+  WeightMSE       : sum_{j in gp} e_{r,j}^2
+  LinearResponse  : (1/N) sum_t ( sum_{j in gp} e_{r,j} x_{j,t} )^2
+  Mixed(linear)   : (1-lam)*weight_gp + lam*linear_gp
+  SigmaAware      : (1/N) sum_t s_{r,t}^2 ( sum_{j in gp} e_{r,j} x_{j,t} )^2
+  Mixed(sigma)    : (1-lam)*weight_gp + lam*sigma_gp (shared mean slope)
 
-TWO METRIC BACKENDS
--------------------
-Tier 1/2/3 use a precomputed GRAM matrix  G = (1/N) X X^T  of shape
-(d_in, d_in), accumulated incrementally during one calibration pass. This is
-token-count-independent (d_in^2 floats regardless of n_tok) and needs no
-stored activations. Scoring is the dense quadratic form e^T G e.
-
-Sigma-aware needs per-output-row slopes S = sigma'(W x), so its metric
-X S^2 X^T differs per row and cannot collapse to a single shared Gram. It
-therefore keeps the stored activations X (layer-batched upstream to cap RAM).
-
-Quadratic forms, per row r of E (d_out x d_in):
-  WeightMSE       : ||e_r||^2
-  LinearResponse  : e_r^T G e_r              with G = XX^T/N      (Gram)
-  Mixed(linear)   : (1-lam)||e_r||^2 + lam e_r^T G e_r           (Gram)
-  Mixed(sigma)    : (1-lam)||e_r||^2 + lam e_r^T (X Sbar^2 X^T/N) e_r  (X)
-  SigmaAware      : (1-lam)||e_r||^2 + lam (1/N) sum_t s_{r,t}^2 (e_r.x_t)^2  (X)
+Each method's score(E, gidx) returns (d_out, n_groups): the per-group penalty
+of the FULL-row error E restricted to each group's channels. Cross-group
+coupling (a group's clip affecting another group's activation term) is ignored
+by construction — each group's clip only changes that group's channels of e,
+and the metric's cross terms between groups are not part of a single group's
+decision. This matches how the quantizer applies an independent scale per
+group.
 """
 
 from __future__ import annotations
 
 import torch
-from typing import Callable, Optional
+from typing import Callable
 
 
+# QuantFn now takes a PER-GROUP clip of shape (d_out, n_groups, 1).
 QuantFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
 
-# ==========================================================================
-# Gram accumulator for Tier 1/2/3.
-#   Accumulate G = sum_t x_t x_t^T over calibration tokens, then normalize by
-#   N. Token-count-independent: only d_in x d_in floats are ever held.
-#   Update in chunks to bound the transient (X_chunk X_chunk^T).
-# ==========================================================================
-class GramAccumulator:
+def _group_index(d_in: int, group_size: int, device) -> tuple[torch.Tensor, int, int]:
     """
-    Incremental accumulation of G = (1/N) sum_t x_t x_t^T  (d_in x d_in).
-
-    Usage:
-        acc = GramAccumulator(d_in, device, dtype=torch.float32)
-        for X_chunk in chunks:            # X_chunk: (d_in, n_chunk)
-            acc.update(X_chunk)
-        G = acc.finalize()                # (d_in, d_in)
+    Returns (gidx, n_groups, pad) where gidx maps each input channel j in
+    [0, d_in) to its group id in [0, n_groups). Padding channels (if d_in is
+    not a multiple of group_size) are NOT included; callers pad separately.
     """
+    n_groups = (d_in + group_size - 1) // group_size
+    pad = n_groups * group_size - d_in
+    gidx = torch.arange(d_in, device=device) // group_size  # (d_in,)
+    return gidx, n_groups, pad
 
-    def __init__(self, d_in: int, device, dtype=torch.float32):
-        self.d_in = d_in
-        self.device = device
-        self.dtype = dtype
-        self.G = torch.zeros(d_in, d_in, device=device, dtype=dtype)
-        self.n = 0
 
-    @torch.no_grad()
-    def update(self, X_chunk: torch.Tensor):
-        """X_chunk: (d_in, n_chunk) on any device; moved to accumulator device."""
-        Xc = X_chunk.to(self.device, self.dtype)
-        self.G += Xc @ Xc.t()
-        self.n += Xc.shape[1]
-
-    @torch.no_grad()
-    def finalize(self) -> torch.Tensor:
-        if self.n == 0:
-            return self.G
-        return self.G / self.n
+def _scatter_group_sum(per_channel: torch.Tensor, gidx: torch.Tensor,
+                       n_groups: int) -> torch.Tensor:
+    """
+    per_channel : (d_out, d_in) nonneg per-channel contributions.
+    Returns (d_out, n_groups): sum of contributions within each group.
+    """
+    d_out = per_channel.shape[0]
+    out = torch.zeros(d_out, n_groups, device=per_channel.device,
+                      dtype=per_channel.dtype)
+    idx = gidx.unsqueeze(0).expand(d_out, -1)  # (d_out, d_in)
+    out.scatter_add_(1, idx, per_channel)
+    return out
 
 
 class ClipRange:
-    """Base clip-range selector. Subclasses implement score(E)."""
+    """Base group-wise clip-range selector. Subclasses implement score()."""
 
     name = "base"
 
@@ -91,140 +80,183 @@ class ClipRange:
         self.grid_min = grid_min
         self.grid_max = grid_max
 
-    # uses_gram: True -> driver supplies a precomputed Gram via prepare(G=...)
-    #            False -> driver supplies stored activations X via prepare(X=...)
-    uses_gram = False
-
-    def prepare(self, W: torch.Tensor, *, G=None, X=None, pre_act_fn=None):
-        """
-        Cache metric machinery. Called once per layer.
-
-        W : (d_out, d_in) weight (float).
-        G : (d_in, d_in) precomputed Gram XX^T/N  (Gram-backend methods).
-        X : (d_in, n_tok) stored activations      (X-backend methods).
-        pre_act_fn : callable A=W@X -> slopes S    (sigma methods).
-        """
+    def prepare(self, W: torch.Tensor, *, group_size: int,
+                G=None, X=None, pre_act_fn=None):
         self.W = W
+        self.group_size = group_size
+        d_out, d_in = W.shape
+        self.gidx, self.n_groups, self.pad = _group_index(d_in, group_size, W.device)
 
     def score(self, E: torch.Tensor) -> torch.Tensor:
+        """E: (d_out, d_in) full-row error. Return (d_out, n_groups)."""
         raise NotImplementedError
 
     @torch.no_grad()
     def select_clip(self, W: torch.Tensor, quant_fn: QuantFn) -> torch.Tensor:
-        d_out = W.shape[0]
-        max_abs = W.abs().amax(dim=1, keepdim=True).clamp(min=1e-8)
-        best_score = torch.full((d_out,), float("inf"), device=W.device)
-        best_clip = max_abs.clone()
+        """
+        Returns per-group clip of shape (d_out, n_groups, 1), suitable for the
+        group-wise quantizer below.
+        """
+        d_out, d_in = W.shape
+        gs = self.group_size
+        n_groups = self.n_groups
+
+        # Per-group max-abs of W -> per-group clip ceiling.
+        if self.pad > 0:
+            Wp = torch.zeros(d_out, n_groups * gs, device=W.device, dtype=W.dtype)
+            Wp[:, :d_in] = W
+        else:
+            Wp = W
+        Wg = Wp.reshape(d_out, n_groups, gs)
+        g_maxabs = Wg.abs().amax(dim=2, keepdim=True).clamp(min=1e-8)  # (d_out, G, 1)
+
+        best_score = torch.full((d_out, n_groups), float("inf"), device=W.device)
+        best_clip = g_maxabs.clone()  # (d_out, G, 1)
+
         for g in range(self.n_grid + 1):
             frac = self.grid_min + (self.grid_max - self.grid_min) * g / self.n_grid
-            clip = max_abs * frac
-            Wq = quant_fn(W, clip)
+            clip = g_maxabs * frac                       # (d_out, G, 1)
+            Wq = quant_fn(W, clip)                        # (d_out, d_in)
             E = Wq - W
-            s = self.score(E)
-            improve = s < best_score
+            s = self.score(E)                            # (d_out, G)
+            improve = s < best_score                     # (d_out, G)
             best_score = torch.where(improve, s, best_score)
-            best_clip = torch.where(improve.unsqueeze(1), clip, best_clip)
-        return best_clip
+            best_clip = torch.where(improve.unsqueeze(2), clip, best_clip)
+
+        return best_clip                                 # (d_out, G, 1)
 
 
 # ==========================================================================
-# Tier 1 : weight-MSE   M = I   (no metric data needed)
+# Tier 1 : weight-MSE   M = I   (per-group)
 # ==========================================================================
 class WeightMSE(ClipRange):
     name = "weight_mse"
-    uses_gram = False  # needs neither G nor X
 
-    def prepare(self, W, *, G=None, X=None, pre_act_fn=None):
-        self.W = W
+    def prepare(self, W, *, group_size, G=None, X=None, pre_act_fn=None):
+        super().prepare(W, group_size=group_size)
 
     def score(self, E):
-        return E.pow(2).sum(dim=1)
+        per_ch = E.pow(2)                                # (d_out, d_in)
+        return _scatter_group_sum(per_ch, self.gidx, self.n_groups)
 
 
 # ==========================================================================
-# Tier 2 : linear-response   M = G = XX^T/N    (X backend, like SigmaAware)
-#   e^T G e = (1/N) ||e^T X||^2 = (1/N) sum_t (e_r . x_t)^2
+# Tier 2 : linear-response   M = XX^T/N   (per-group, X backend)
+#   group penalty = (1/N) sum_t ( sum_{j in gp} e_{r,j} x_{j,t} )^2
 # ==========================================================================
 class LinearResponse(ClipRange):
     name = "linear_response"
-    uses_gram = False
 
-    def prepare(self, W, *, G=None, X=None, pre_act_fn=None):
+    def prepare(self, W, *, group_size, G=None, X=None, pre_act_fn=None):
         assert X is not None, "LinearResponse needs stored X"
-        self.W = W
-        self.X = X                           # (d_in, n_tok)
+        super().prepare(W, group_size=group_size)
+        self.X = X                                       # (d_in, n_tok)
         self.ntok = X.shape[1]
 
+    def _group_partials(self, E):
+        """
+        Returns U_gp of shape (d_out, n_groups, n_tok): the partial pre-activation
+        contribution of each group, u^{gp}_{r,t} = sum_{j in gp} e_{r,j} x_{j,t}.
+        Built by masking E to each group. Memory: d_out * n_groups * n_tok.
+        For large n_groups this is heavy; see batched variant in note below.
+        """
+        d_out, d_in = E.shape
+        # contribution per channel per token then scatter-add into groups:
+        # u^{gp}_{r,t} = sum_j [gidx_j==gp] e_{r,j} x_{j,t}
+        # Compute EX_channel = E_{r,j} * x_{j,t} is (d_out, d_in, n_tok) -- too big.
+        # Instead loop groups (n_groups is small, ~ d_in/128).
+        U = torch.empty(d_out, self.n_groups, self.ntok, device=E.device,
+                        dtype=E.dtype)
+        for gp in range(self.n_groups):
+            mask = (self.gidx == gp)                     # (d_in,)
+            Eg = E[:, mask]                              # (d_out, gsize_gp)
+            Xg = self.X[mask, :]                         # (gsize_gp, n_tok)
+            U[:, gp, :] = Eg @ Xg                        # (d_out, n_tok)
+        return U
+
     def score(self, E):
-        U = E @ self.X                       # (d_out, n_tok) ; u_{r,t}=e_r.x_t
-        return U.pow(2).sum(dim=1) / self.ntok
+        U = self._group_partials(E)                      # (d_out, G, n_tok)
+        return U.pow(2).sum(dim=2) / self.ntok           # (d_out, G)
+
 
 # ==========================================================================
-# Tier 3 : mixed  M = (1-lam) I + lam M_inner
-#   inner="linear" : X backend, M_inner = XX^T/N
-#   inner="sigma"  : X backend, single shared mean-slope weighting
+# Tier 3 : mixed  M = (1-lam) I + lam M_inner   (per-group)
 # ==========================================================================
 class Mixed(ClipRange):
     name = "mixed"
-    uses_gram = False
 
     def __init__(self, lam=0.5, inner="linear", n_grid=20, grid_min=0.5, grid_max=1.0):
         super().__init__(n_grid, grid_min, grid_max)
         self.lam = float(lam)
         self.inner = inner
 
-    def prepare(self, W, *, G=None, X=None, pre_act_fn=None):
-        self.W = W
+    def prepare(self, W, *, group_size, G=None, X=None, pre_act_fn=None):
+        super().prepare(W, group_size=group_size)
         if self.inner == "linear":
             assert X is not None, "Mixed(linear) needs stored X"
-            self.X = X                       # (d_in, n_tok)
+            self.X = X
             self.ntok = X.shape[1]
-        else:  # sigma inner: shared mean-slope weighting on stored X
+        else:
             assert X is not None and pre_act_fn is not None, \
                 "Mixed(sigma) needs stored X and pre_act_fn"
             A = W @ X
             S = pre_act_fn(A)
-            s = S.mean(dim=0).clamp(min=0.0)        # (n_tok,)
-            self.XS = X * s.unsqueeze(0)            # (d_in, n_tok)
+            s = S.mean(dim=0).clamp(min=0.0)             # (n_tok,)
+            self.XS = X * s.unsqueeze(0)                 # (d_in, n_tok)
             self.ntok = X.shape[1]
 
+    def _group_partials(self, E, Xmat):
+        d_out = E.shape[0]
+        U = torch.empty(d_out, self.n_groups, self.ntok, device=E.device,
+                        dtype=E.dtype)
+        for gp in range(self.n_groups):
+            mask = (self.gidx == gp)
+            U[:, gp, :] = E[:, mask] @ Xmat[mask, :]
+        return U
+
     def score(self, E):
-        weight_term = E.pow(2).sum(dim=1)
-        if self.inner == "linear":
-            U = E @ self.X
-            inner_term = U.pow(2).sum(dim=1) / self.ntok
-        else:
-            EX = E @ self.XS
-            inner_term = EX.pow(2).sum(dim=1) / self.ntok
+        weight_term = _scatter_group_sum(E.pow(2), self.gidx, self.n_groups)
+        Xmat = self.X if self.inner == "linear" else self.XS
+        U = self._group_partials(E, Xmat)
+        inner_term = U.pow(2).sum(dim=2) / self.ntok
         return (1.0 - self.lam) * weight_term + self.lam * inner_term
 
+
 # ==========================================================================
-# Paper method : sigma-aware   M_sigma = (1/N) X S^2 X^T   (X backend, per-row)
-#   lam = 0   -> unfloored NAC
-#   lam > 0   -> Floored-NAC : (1-lam) I + lam M_sigma
+# Paper method : sigma-aware   M_sigma = X S^2 X^T / N   (per-group, per-row S)
+#   group penalty = (1/N) sum_t s_{r,t}^2 ( sum_{j in gp} e_{r,j} x_{j,t} )^2
 # ==========================================================================
 class SigmaAware(ClipRange):
     name = "sigma_aware"
-    uses_gram = False
 
     def __init__(self, lam=0.0, n_grid=20, grid_min=0.5, grid_max=1.0):
         super().__init__(n_grid, grid_min, grid_max)
         self.lam = float(lam)
 
-    def prepare(self, W, *, G=None, X=None, pre_act_fn=None):
+    def prepare(self, W, *, group_size, G=None, X=None, pre_act_fn=None):
         assert X is not None and pre_act_fn is not None, \
             "SigmaAware needs stored X and pre_act_fn"
-        self.W = W
-        self.X = X                          # (d_in, n_tok)
-        A = W @ X                           # (d_out, n_tok)
-        self.S = pre_act_fn(A)              # (d_out, n_tok)
+        super().prepare(W, group_size=group_size)
+        self.X = X                                       # (d_in, n_tok)
+        A = W @ X                                        # (d_out, n_tok)
+        self.S = pre_act_fn(A)                            # (d_out, n_tok)
         self.ntok = X.shape[1]
 
+    def _group_partials(self, E):
+        d_out = E.shape[0]
+        U = torch.empty(d_out, self.n_groups, self.ntok, device=E.device,
+                        dtype=E.dtype)
+        for gp in range(self.n_groups):
+            mask = (self.gidx == gp)
+            U[:, gp, :] = E[:, mask] @ self.X[mask, :]   # (d_out, n_tok)
+        return U
+
     def score(self, E):
-        U = E @ self.X                       # (d_out, n_tok) ; u_{r,t}=e_r.x_t
-        sigma_term = (self.S.pow(2) * U.pow(2)).sum(dim=1) / self.ntok
+        U = self._group_partials(E)                      # (d_out, G, n_tok)
+        S2 = self.S.pow(2).unsqueeze(1)                  # (d_out, 1, n_tok)
+        sigma_term = (S2 * U.pow(2)).sum(dim=2) / self.ntok   # (d_out, G)
         if self.lam > 0.0:
-            weight_term = E.pow(2).sum(dim=1)
+            weight_term = _scatter_group_sum(E.pow(2), self.gidx, self.n_groups)
             return (1.0 - self.lam) * weight_term + self.lam * sigma_term
         return sigma_term
 
@@ -241,5 +273,42 @@ def build_clip_range(kind, lam=0.5, inner="linear", n_grid=20,
                      grid_min=grid_min, grid_max=grid_max)
     if kind == "sigma_aware":
         return SigmaAware(lam=lam, n_grid=n_grid, grid_min=grid_min, grid_max=grid_max)
-    raise ValueError(f"Unknown clip-range kind: {kind!r}. "
-                     "weight_mse | linear_response | mixed | sigma_aware")
+    raise ValueError(f"Unknown clip-range kind: {kind!r}")
+
+
+# ==========================================================================
+# Group-wise quantizer accepting a PER-GROUP clip (d_out, n_groups, 1).
+# Drop-in replacement for groupwise_rtn_symmetric; the clip is now per group
+# instead of per row.
+# ==========================================================================
+@torch.no_grad()
+def groupwise_rtn_symmetric(W: torch.Tensor, clip: torch.Tensor,
+                            bits: int, group_size: int) -> torch.Tensor:
+    """
+    W    : (d_out, d_in)
+    clip : (d_out, n_groups, 1) per-GROUP clip magnitude.
+    """
+    d_out, d_in = W.shape
+    qmax = 2 ** (bits - 1) - 1
+    n_groups = (d_in + group_size - 1) // group_size
+    pad = n_groups * group_size - d_in
+    if pad > 0:
+        Wp = torch.zeros(d_out, n_groups * group_size, device=W.device, dtype=W.dtype)
+        Wp[:, :d_in] = W
+    else:
+        Wp = W
+    Wg = Wp.reshape(d_out, n_groups, group_size)         # (d_out, G, gs)
+    g_maxabs = Wg.abs().amax(dim=2, keepdim=True)         # (d_out, G, 1)
+    eff = torch.minimum(g_maxabs, clip).clamp(min=1e-8)   # (d_out, G, 1)
+    delta = eff / qmax
+    q = torch.round(Wg / delta).clamp(-qmax, qmax)
+    Wdq = (q * delta).reshape(d_out, n_groups * group_size)
+    if pad > 0:
+        Wdq = Wdq[:, :d_in]
+    return Wdq
+
+
+def make_quant_fn(bits: int, group_size: int):
+    def quant_fn(W, clip):
+        return groupwise_rtn_symmetric(W, clip, bits, group_size)
+    return quant_fn

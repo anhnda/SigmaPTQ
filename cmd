@@ -39,8 +39,21 @@ WikiText-2      6.1255          6.1081               +0.285%  Tie
 C4              9.9673          9.9483               +0.190%  Tie               
                                                                          
 
-Mix vs Linear                                                                         Dataset         Heuristic AWQ   Standard AWQ    Delta        Winner                                           
+Sigma vs Mix                                                                         Dataset         Heuristic AWQ   Standard AWQ    Delta        Winner                                           
 --------------------------------------------------------------------------------                              
 WikiText-2      6.1226          6.1081               +0.238%  Tie                                             
 C4              9.9815          9.9483               +0.334%  Tie                                             
-                                                                     
+
+3bit
+Sigma vs Mix                                                                                                              
+Dataset         Heuristic AWQ   Standard AWQ    Delta        Winner                                           
+--------------------------------------------------------------------------------                              
+WikiText-2      10.7070         10.6912              +0.147%  Tie                                             
+C4              18.5003         18.3852              +0.626%  Standard                                        
+                                                                         
+Linear vs  WeightMSE
+Dataset         Heuristic AWQ   Standard AWQ    Delta        Winner                                           
+--------------------------------------------------------------------------------                              
+WikiText-2      9.8049          24.4221             -59.852%  Heuristic                                       
+C4              17.0174         38.2704             -55.534%  Heuristic                                       
+                                                                            

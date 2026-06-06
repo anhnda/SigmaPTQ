@@ -1,5 +1,5 @@
 """
-Cross-Dataset Validation: AWQ Methods with Sliding Window Evaluation (FINAL CORRECTED)
+Cross-Dataset Validation: PTQ Methods with Sliding Window Evaluation (FINAL CORRECTED)
 
 Fixes:
 1. Sliding Window Math: Now uses correct context masking (labels=-100).
@@ -24,7 +24,7 @@ import warnings
 from pathlib import Path
 
 
-class AWQSlidingWindowValidator:
+class PTQSlidingWindowValidator:
     def __init__(self, device="cuda", seed=42, stride=512, max_length=2048, cache_dir="./dataset_cache"):
         self.device = device
         self.seed = seed
@@ -35,7 +35,7 @@ class AWQSlidingWindowValidator:
         self.cache_dir.mkdir(exist_ok=True)
 
         print("=" * 80)
-        print("AWQ SLIDING WINDOW CROSS-DATASET VALIDATION (FINAL)")
+        print("PTQ SLIDING WINDOW CROSS-DATASET VALIDATION (FINAL)")
         print("=" * 80)
         print(f"Device: {device}")
         print(f"Stride: {stride}")
@@ -296,9 +296,9 @@ class AWQSlidingWindowValidator:
         print("EVALUATING MODELS")
         print("=" * 80)
 
-        models = {"Heuristic AWQ": heuristic_path}
+        models = {"Heuristic PTQ": heuristic_path}
         if standard_path:
-            models["Standard AWQ"] = standard_path
+            models["Standard PTQ"] = standard_path
 
         for dataset_name, texts in datasets.items():
             print(f"\n{'='*80}")
@@ -346,17 +346,17 @@ class AWQSlidingWindowValidator:
                     })
             return dataset_results
 
-        print(f"\n{'Dataset':<15} {'Heuristic AWQ':<15} {'Standard AWQ':<15} {'Delta':<12} {'Winner':<10}")
+        print(f"\n{'Dataset':<15} {'Heuristic PTQ':<15} {'Standard PTQ':<15} {'Delta':<12} {'Winner':<10}")
         print("-" * 80)
 
         dataset_results = []
         for dataset_name in self.results.keys():
             if (
-                "Heuristic AWQ" in self.results[dataset_name]
-                and "Standard AWQ" in self.results[dataset_name]
+                "Heuristic PTQ" in self.results[dataset_name]
+                and "Standard PTQ" in self.results[dataset_name]
             ):
-                heur_ppl = self.results[dataset_name]["Heuristic AWQ"]["perplexity"]
-                std_ppl = self.results[dataset_name]["Standard AWQ"]["perplexity"]
+                heur_ppl = self.results[dataset_name]["Heuristic PTQ"]["perplexity"]
+                std_ppl = self.results[dataset_name]["Standard PTQ"]["perplexity"]
                 delta = heur_ppl - std_ppl
                 delta_pct = (delta / std_ppl) * 100
                 winner = "Heuristic" if delta < -0.05 else ("Standard" if delta > 0.05 else "Tie")
@@ -390,8 +390,8 @@ class AWQSlidingWindowValidator:
         ties = sum(1 for r in dataset_results if r["winner"] == "Tie")
 
         print(f"\nWin Count:")
-        print(f"  Heuristic AWQ: {heur_wins}/{len(dataset_results)}")
-        print(f"  Standard AWQ:  {std_wins}/{len(dataset_results)}")
+        print(f"  Heuristic PTQ: {heur_wins}/{len(dataset_results)}")
+        print(f"  Standard PTQ:  {std_wins}/{len(dataset_results)}")
         print(f"  Ties:          {ties}/{len(dataset_results)}")
 
         avg_heur = np.mean([r["heuristic_ppl"] for r in dataset_results])
@@ -399,8 +399,8 @@ class AWQSlidingWindowValidator:
         avg_delta_pct = ((avg_heur - avg_std) / avg_std) * 100
 
         print(f"\nAverage Perplexity:")
-        print(f"  Heuristic AWQ: {avg_heur:.4f}")
-        print(f"  Standard AWQ:  {avg_std:.4f}")
+        print(f"  Heuristic PTQ: {avg_heur:.4f}")
+        print(f"  Standard PTQ:  {avg_std:.4f}")
         print(f"  Difference:    {avg_delta_pct:+.3f}%")
 
         print("\n" + "=" * 80)
@@ -408,15 +408,15 @@ class AWQSlidingWindowValidator:
         print("=" * 80)
 
         if heur_wins > std_wins:
-            print(f"\n🏆 HEURISTIC AWQ is the OVERALL WINNER!")
+            print(f"\n🏆 HEURISTIC PTQ is the OVERALL WINNER!")
             print(f"   Wins: {heur_wins}/{len(dataset_results)} datasets")
             print(f"   Average improvement: {abs(avg_delta_pct):.3f}%")
-            winner = "Heuristic AWQ"
+            winner = "Heuristic PTQ"
         elif std_wins > heur_wins:
-            print(f"\n🏆 STANDARD AWQ is the OVERALL WINNER!")
+            print(f"\n🏆 STANDARD PTQ is the OVERALL WINNER!")
             print(f"   Wins: {std_wins}/{len(dataset_results)} datasets")
             print(f"   Average improvement: {abs(avg_delta_pct):.3f}%")
-            winner = "Standard AWQ"
+            winner = "Standard PTQ"
         else:
             print(f"\n🤝 TIE - Both methods equally strong")
             winner = "Tie"
@@ -440,14 +440,14 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="AWQ Sliding Window Cross-Dataset Validation",
+        description="PTQ Sliding Window Cross-Dataset Validation",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--heuristic-path", type=str, required=True,
-                        help="Path to Heuristic AWQ model")
+                        help="Path to Heuristic PTQ model")
     parser.add_argument("--standard-path", type=str, default="",
-                        help="Path to Standard AWQ model (optional for comparison)")
-    parser.add_argument("--n-samples", type=int, default=2000,
+                        help="Path to Standard PTQ model (optional for comparison)")
+    parser.add_argument("--n-samples", type=int, default=500,
                         help="Number of samples per dataset")
     parser.add_argument("--cache-dir", type=str, default="./dataset_cache",
                         help="Directory to cache downloaded datasets")
@@ -457,7 +457,7 @@ def main():
                     help="Stride between windows")
     args = parser.parse_args()
 
-    validator = AWQSlidingWindowValidator(
+    validator = PTQSlidingWindowValidator(
         cache_dir=args.cache_dir,
         max_length=args.max_length,
         stride=args.stride,
