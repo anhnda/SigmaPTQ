@@ -1,5 +1,5 @@
 """
-base_cr_groupwise.py
+base_cr.py
 ====================
 Group-wise clip-range selection for weight-only group-wise PTQ.
 
