@@ -28,6 +28,7 @@ run () {  # name  extra-args...
       --output-dir "$OUT/$name"
   python eval_ppl.py --model-path "$OUT/$name" \
       --datasets wikitext2 c4 --seqlen 2048
+  rm -rf "$OUT/$name"  # clean up quantized model to save space
 }
 
 run g_linear     --metric linear_response
