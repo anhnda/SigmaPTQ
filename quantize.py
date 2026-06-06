@@ -349,7 +349,7 @@ def main():
     p.add_argument("--max-tokens-per-sample", type=int, default=512)
     p.add_argument("--layer-batch-size", type=int, default=16)
     p.add_argument("--max-tok-total", type=int, default=4096)
-    p.add_argument("--calib-dataset", type=str, default="wikitext2",
+    p.add_argument("--calib-dataset", type=str, default="c4",
                    choices=["c4", "wikitext2"])
     p.add_argument("--cache-dir", type=str, default="./calibration_cache")
     p.add_argument("--skip-lmhead", dest="skip_lmhead", action="store_true",
