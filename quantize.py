@@ -33,6 +33,7 @@ import torch.nn as nn
 
 # Group-wise clip-range classes AND the matching per-group quantizer.
 from base_cr import build_clip_range, make_quant_fn
+
 try:
     from tqdm import tqdm
 except ImportError:  # graceful no-op fallback if tqdm absent
@@ -287,7 +288,7 @@ def quantize_weight_mse_backend(model, linear_layers, target_names, args):
         W = module.weight.data
         orig_dtype = W.dtype
         Wf = W.float()
-        cr = build_clip_range("weight_mse", n_grid=args.n_grid)
+        cr = build_clip_range(args.clip_range, n_grid=args.n_grid)
         cr.prepare(Wf, group_size=gs)
         clip = cr.select_clip(Wf, quant_fn)                   # (d_out, G, 1)
         module.weight.data = quant_fn(Wf, clip).to(orig_dtype)
@@ -312,7 +313,7 @@ def quantize_model(model, tokenizer, calib_texts, args):
     print(f"\nFound {len(linear_layers)} Linear layers. "
           f"Clip-range: {args.clip_range} | GROUP-WISE clip")
 
-    if args.clip_range == "weight_mse":
+    if args.clip_range in ("rtn", "weight_mse"):
         print("Backend: weight-only (no activations).")
         stats = quantize_weight_mse_backend(model, linear_layers,
                                             target_names, args)
@@ -334,7 +335,7 @@ def main():
     p.add_argument("--output-dir", type=str,
                    default="./quantized_models/model_rtn_cr")
     p.add_argument("--clip-range", type=str, default="linear_response",
-                   choices=["weight_mse", "linear_response", "mixed", "sigma_aware"])
+                   choices=["rtn", "weight_mse", "linear_response", "mixed", "sigma_aware"])
     p.add_argument("--inner", type=str, default="linear", choices=["linear", "sigma"])
     p.add_argument("--lam", type=float, default=0.5)
     p.add_argument("--bits", type=int, default=4, choices=[3, 4])

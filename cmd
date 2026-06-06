@@ -31,29 +31,10 @@ Mistral 7B /home/DATA/prometheus/anh/.cache/huggingface/hub/models--mistralai--M
 Qwen2.5 /home/DATA/prometheus/anh/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B/snapshots/d149729398750b98c0af14eb82c78cfe92750796 
 
 Llama 3.1.
-
-Linear vs Sigma
-Dataset         Heuristic AWQ   Standard AWQ    Delta        Winner             
---------------------------------------------------------------------------------
-WikiText-2      6.1255          6.1081               +0.285%  Tie               
-C4              9.9673          9.9483               +0.190%  Tie               
-                                                                         
-
-Sigma vs Mix                                                                         Dataset         Heuristic AWQ   Standard AWQ    Delta        Winner                                           
+3bits:
+Sigma vs Linear
+Dataset         Heuristic PTQ   Standard PTQ    Delta        Winner                                           
 --------------------------------------------------------------------------------                              
-WikiText-2      6.1226          6.1081               +0.238%  Tie                                             
-C4              9.9815          9.9483               +0.334%  Tie                                             
-
-3bit
-Sigma vs Mix                                                                                                              
-Dataset         Heuristic AWQ   Standard AWQ    Delta        Winner                                           
---------------------------------------------------------------------------------                              
-WikiText-2      10.7070         10.6912              +0.147%  Tie                                             
-C4              18.5003         18.3852              +0.626%  Standard                                        
-                                                                         
-Linear vs  WeightMSE
-Dataset         Heuristic AWQ   Standard AWQ    Delta        Winner                                           
---------------------------------------------------------------------------------                              
-WikiText-2      9.8049          24.4221             -59.852%  Heuristic                                       
-C4              17.0174         38.2704             -55.534%  Heuristic                                       
-                                                                            
+WikiText-2      8.4249          8.4569               -0.378%  Tie                                             
+C4              14.6398         14.7111              -0.485%  Heuristic                                       
+                                                                                   

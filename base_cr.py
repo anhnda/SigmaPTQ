@@ -110,6 +110,8 @@ class ClipRange:
         Wg = Wp.reshape(d_out, n_groups, gs)
         g_maxabs = Wg.abs().amax(dim=2, keepdim=True).clamp(min=1e-8)  # (d_out, G, 1)
 
+        # Standard per-group MSE clip search: grid the clip ratio over
+        # [grid_min, grid_max], score per group, keep the per-group minimum.
         best_score = torch.full((d_out, n_groups), float("inf"), device=W.device)
         best_clip = g_maxabs.clone()  # (d_out, G, 1)
 
@@ -124,6 +126,35 @@ class ClipRange:
             best_clip = torch.where(improve.unsqueeze(2), clip, best_clip)
 
         return best_clip                                 # (d_out, G, 1)
+
+
+# ==========================================================================
+# Tier 0 : plain RTN — NO clip search. Clip = per-group max-abs (cf = 1.0).
+#   This is the standard absmax group-wise RTN baseline: every group uses its
+#   own full max-abs as the scale, no clipping. Overrides select_clip to skip
+#   the grid entirely (score() is never called).
+# ==========================================================================
+class PlainRTN(ClipRange):
+    name = "rtn"
+
+    def prepare(self, W, *, group_size, G=None, X=None, pre_act_fn=None):
+        super().prepare(W, group_size=group_size)
+
+    @torch.no_grad()
+    def select_clip(self, W, quant_fn):
+        d_out, d_in = W.shape
+        gs = self.group_size
+        n_groups = self.n_groups
+        if self.pad > 0:
+            Wp = torch.zeros(d_out, n_groups * gs, device=W.device, dtype=W.dtype)
+            Wp[:, :d_in] = W
+        else:
+            Wp = W
+        g_maxabs = Wp.reshape(d_out, n_groups, gs).abs().amax(dim=2, keepdim=True)
+        return g_maxabs.clamp(min=1e-8)                  # (d_out, G, 1), cf = 1.0
+
+    def score(self, E):                                  # never used
+        return _scatter_group_sum(E.pow(2), self.gidx, self.n_groups)
 
 
 # ==========================================================================
@@ -264,6 +295,8 @@ class SigmaAware(ClipRange):
 def build_clip_range(kind, lam=0.5, inner="linear", n_grid=20,
                      grid_min=0.5, grid_max=1.0):
     kind = kind.lower()
+    if kind == "rtn":
+        return PlainRTN(n_grid, grid_min, grid_max)
     if kind == "weight_mse":
         return WeightMSE(n_grid, grid_min, grid_max)
     if kind == "linear_response":
