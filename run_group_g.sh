@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 # run_group_g.sh
 # ==============
-# Group G core comparison (paper's central claim), W3/g128, NO rho as primary
-# per the M1 mechanism finding. Quantizes the three metrics with everything
-# else fixed, then evaluates perplexity on each. Loops over all three models.
+# Group G core comparison (paper's central claim), NO rho as primary per the
+# M1 mechanism finding. Quantizes each metric with everything else fixed, then
+# evaluates perplexity. Loops over all three models AND bit widths {4,3},
+# with an RTN baseline arm added per bit width.
 #
-#   linear_response   M_2   (XX^T)              baseline
-#   pointwise         M_sigma (gate only)       incomplete special case
-#   gated (no-rho)    Eq.11/13                  PRIMARY method
-#   gated (+rho)      Eq.14                      ablation arm
+#   rtn               nearest, no clip search    floor baseline
+#   linear_response   M_2   (XX^T)               baseline
+#   pointwise         M_sigma (gate only)        incomplete special case
+#   gated (no-rho)    Eq.11/13                   PRIMARY method
+#   gated (+rho)      Eq.14                       ablation arm
 #
 # Usage:  bash run_group_g.sh
 #         NCALIB=256 bash run_group_g.sh
+#         BITS="4 3 2" bash run_group_g.sh
 
 set -euo pipefail
 
@@ -24,14 +27,15 @@ declare -A MODELS=(
 
 OUT="${OUT:-./quantized_models/group_g}"
 NCALIB="${NCALIB:-128}"
+BITS="${BITS:-3 4}"
 mkdir -p "$OUT"
 
-run () {  # model-name  model-path  run-name  extra-args...
-  local mname="$1"; local mpath="$2"; local name="$3"; shift 3
-  local rundir="$OUT/$mname/$name"
-  echo "=== G [$mname]: $name ==="
+run () {  # model-name  model-path  bits  run-name  extra-args...
+  local mname="$1"; local mpath="$2"; local bits="$3"; local name="$4"; shift 4
+  local rundir="$OUT/$mname/w${bits}/$name"
+  echo "=== G [$mname w${bits}]: $name ==="
   python quantize.py --model-path "$mpath" "$@" \
-      --bits 3 --group-size 128 --n-calib "$NCALIB" \
+      --bits "$bits" --group-size 128 --n-calib "$NCALIB" \
       --output-dir "$rundir"
   python eval_ppl.py --model-path "$rundir" \
       --datasets wikitext2 c4 --seqlen 2048
@@ -46,16 +50,19 @@ run () {  # model-name  model-path  run-name  extra-args...
 
 for mname in "${!MODELS[@]}"; do
   mpath="${MODELS[$mname]}"
-  echo
-  echo "########## MODEL: $mname ##########"
-  run "$mname" "$mpath" g_linear     --metric linear_response
-  run "$mname" "$mpath" g_pointwise  --metric pointwise
-  run "$mname" "$mpath" g_gated      --metric gated --power 2 --no-rho   # PRIMARY
-  run "$mname" "$mpath" g_gated_rho  --metric gated --power 2 --use-rho  # ablation
+  for bits in $BITS; do
+    echo
+    echo "########## MODEL: $mname | bits=$bits ##########"
+    run "$mname" "$mpath" "$bits" g_rtn        --metric rtn
+    run "$mname" "$mpath" "$bits" g_linear     --metric linear_response
+    run "$mname" "$mpath" "$bits" g_pointwise  --metric pointwise
+    run "$mname" "$mpath" "$bits" g_gated      --metric gated --power 2 --no-rho   # PRIMARY
+    run "$mname" "$mpath" "$bits" g_gated_rho  --metric gated --power 2 --use-rho  # ablation
+  done
 done
 
 echo
-echo "Group G done. Per-checkpoint ppl in $OUT/<model>/*/ppl.json"
-echo "Expected per model: ppl(g_gated) <= ppl(g_pointwise) <= ppl(g_linear)"
-echo "                    and ppl(g_gated) <= ppl(g_gated_rho)  (no-rho primary)"
+echo "Group G done. Per-checkpoint ppl in $OUT/<model>/w<bits>/*/ppl.json"
+echo "Expected per (model,bits): ppl(g_gated) <= ppl(g_pointwise) <= ppl(g_linear) <= ppl(g_rtn)"
+echo "                           and ppl(g_gated) <= ppl(g_gated_rho)  (no-rho primary)"
 echo "Collect with: python collect_ppl.py $OUT"
