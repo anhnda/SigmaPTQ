@@ -6,6 +6,10 @@
 # decoder layers, before any benchmark runs. GPU-light: a handful of layers,
 # a few dozen calibration samples.
 #
+# mechanism_check.py writes ONLY a JSON summary (--out); it never saves a
+# quantized model. Each run's console output is tee'd to a .log next to its
+# JSON so the per-layer correlations and verdict are preserved.
+#
 # Usage:
 #   bash run_mechanism.sh
 # Override the model with:  MODEL=/path/to/snapshot bash run_mechanism.sh
@@ -32,7 +36,8 @@ python mechanism_check.py \
     --bits 3 --group-size "$GROUP_SIZE" \
     --use-rho \
     --n-calib "$NCALIB" --blocks sample \
-    --out "$OUTDIR/m_w3_rho_hidden.json"
+    --out "$OUTDIR/m_w3_rho_hidden.json" \
+    2>&1 | tee "$OUTDIR/m_w3_rho_hidden.log"
 
 # ---------------------------------------------------------------------------
 # 2) rho ablation (G2): same setting, rho OFF. Does the downstream gain help
@@ -44,7 +49,8 @@ python mechanism_check.py \
     --bits 3 --group-size "$GROUP_SIZE" \
     --no-rho \
     --n-calib "$NCALIB" --blocks sample \
-    --out "$OUTDIR/m_w3_norho_hidden.json"
+    --out "$OUTDIR/m_w3_norho_hidden.json" \
+    2>&1 | tee "$OUTDIR/m_w3_norho_hidden.log"
 
 # ---------------------------------------------------------------------------
 # 3) Through-down variant: measure true error after W_d (block output y),
@@ -57,7 +63,8 @@ python mechanism_check.py \
     --bits 3 --group-size "$GROUP_SIZE" \
     --use-rho --through-down \
     --n-calib "$NCALIB" --blocks sample \
-    --out "$OUTDIR/m_w3_rho_throughdown.json"
+    --out "$OUTDIR/m_w3_rho_throughdown.json" \
+    2>&1 | tee "$OUTDIR/m_w3_rho_throughdown.log"
 
 # ---------------------------------------------------------------------------
 # 4) Bit-width regime check (C4): W4 is milder, W2 is where the first-order
@@ -70,7 +77,8 @@ for B in 4 2; do
       --bits "$B" --group-size "$GROUP_SIZE" \
       --use-rho \
       --n-calib "$NCALIB" --blocks sample \
-      --out "$OUTDIR/m_w${B}_rho_hidden.json"
+      --out "$OUTDIR/m_w${B}_rho_hidden.json" \
+      2>&1 | tee "$OUTDIR/m_w${B}_rho_hidden.log"
 done
 
 echo

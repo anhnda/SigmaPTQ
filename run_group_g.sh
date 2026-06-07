@@ -28,7 +28,13 @@ run () {  # name  extra-args...
       --output-dir "$OUT/$name"
   python eval_ppl.py --model-path "$OUT/$name" \
       --datasets wikitext2 c4 --seqlen 2048
-  rm -rf "$OUT/$name"  # clean up quantized model to save space
+  # Delete only the large model artifacts; keep ppl.json and any logs/summaries.
+  find "$OUT/$name" -type f \
+      \( -name '*.safetensors' -o -name '*.bin' -o -name '*.pt' \
+         -o -name 'config.json' -o -name 'generation_config.json' \
+         -o -name '*.model' -o -name 'tokenizer*' -o -name '*.txt' \
+         -o -name 'special_tokens_map.json' -o -name '*.index.json' \) \
+      -delete
 }
 
 run g_linear     --metric linear_response
